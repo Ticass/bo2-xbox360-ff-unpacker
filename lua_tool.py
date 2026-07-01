@@ -1541,6 +1541,29 @@ def strip_empty_else_blocks(lines: list[str]) -> list[str]:
     return result
 
 
+def strip_redundant_branch_comments(lines: list[str]) -> list[str]:
+    """Drop jump comments when the emitted `else` already represents the jump."""
+    filtered: list[str] = []
+    for index, line in enumerate(lines):
+        if "-- control flow:" not in line:
+            filtered.append(line)
+            continue
+        indent_len = len(line) - len(line.lstrip(" "))
+        next_line = None
+        for candidate in lines[index + 1:]:
+            if candidate.strip():
+                next_line = candidate
+                break
+        if next_line is not None:
+            next_indent = len(next_line) - len(next_line.lstrip(" "))
+            if next_indent < indent_len and next_line.strip() == "else":
+                continue
+            if next_indent < indent_len and next_line.strip() == "end" and "sBx=-" not in line:
+                continue
+        filtered.append(line)
+    return filtered
+
+
 def sanitize_local_name(value: str, fallback: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in value)
     if cleaned and cleaned[0].isdigit():
@@ -1557,6 +1580,14 @@ def camel_from_parts(parts: list[str], fallback: str) -> str:
     for part in cleaned[1:]:
         name += part[:1].upper() + part[1:]
     return name if is_lua_identifier(name) else fallback
+
+
+def camel_from_label(value: str, fallback: str, prefix: str = "") -> str:
+    """Turn bytecode string hints like `button_prompt_back` into Lua names."""
+    parts = [part for part in re.split(r"[^A-Za-z0-9]+", value) if part]
+    if prefix:
+        parts.insert(0, prefix)
+    return camel_from_parts(parts, fallback)
 
 
 def semantic_name_from_expr(value: str, fallback: str) -> str:
@@ -1838,6 +1869,8 @@ def source_lines_for_proto(
     generic_loop_starts: dict[int, Instruction] = {}
     generic_loop_ends: dict[int, Instruction] = {}
     generic_iterator_calls: set[int] = set()
+    goto_labels_before: dict[int, str] = {}
+    goto_jumps: dict[int, str] = {}
     # Boolean-valued comparisons: cmp -> R_A = (a op b). Keyed by cmp index.
     bool_value: dict[int, int] = {}
     # Short-circuit and/or: TESTSET index -> (dst, operand_expr, "and"/"or", target).
@@ -1903,6 +1936,13 @@ def source_lines_for_proto(
                         previous = meaningful[previous_pos]
                         if previous.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"} and previous.a == inst.a:
                             generic_iterator_calls.add(previous.index)
+
+    generic_back_jumps = {back.index for back in generic_loop_ends.values()}
+    for inst in meaningful:
+        if inst.opname == "JMP" and inst.sbx < 0 and inst.index not in generic_back_jumps:
+            target = inst.index + inst.sbx + 1
+            label = goto_labels_before.setdefault(target, f"loop_{target}")
+            goto_jumps[inst.index] = label
 
 
     # Pass 1b: boolean-valued comparisons `R_A = a op b`, encoded as
@@ -2009,6 +2049,12 @@ def source_lines_for_proto(
             structured_ifs[inst.index] = (following, land, "if")
             close_after[land] = close_after.get(land, 0) + 1
 
+    goto_jumps = {index: label for index, label in goto_jumps.items() if index not in skip_indices}
+    active_goto_labels = set(goto_jumps.values())
+    goto_labels_before = {
+        index: label for index, label in goto_labels_before.items() if label in active_goto_labels
+    }
+
     def emit_block_boundaries(index: int) -> None:
         nonlocal block_depth
         for _ in range(close_after.get(index, 0)):
@@ -2026,6 +2072,8 @@ def source_lines_for_proto(
         # before emitting the instruction itself (the block's `end`/`else`
         # belongs above the first statement that follows the block).
         emit_block_boundaries(inst.index)
+        if inst.index in goto_labels_before:
+            emit(f"::{goto_labels_before[inst.index]}::")
         # Finalize any short-circuit and/or expression that lands here: the
         # operand block has run and left its value in the destination register.
         if inst.index in pending_andor:
@@ -2068,6 +2116,9 @@ def source_lines_for_proto(
                 emit(f"if {condition} then")
             block_depth += 1
             skip_indices.add(jump_inst.index)
+            continue
+        if inst.index in goto_jumps:
+            emit(f"goto {goto_jumps[inst.index]}")
             continue
         if inst.index in generic_loop_starts:
             tfor_inst = generic_loop_starts[inst.index]
@@ -2236,7 +2287,7 @@ def source_lines_for_proto(
         else:
             emit(f"-- unresolved: {readable_instruction_comment(proto, inst)[3:]}")
 
-    lines = strip_empty_else_blocks(strip_trailing_control_comments(lines))
+    lines = strip_redundant_branch_comments(strip_empty_else_blocks(strip_trailing_control_comments(lines)))
     return lines or [f"{indent}-- empty function"]
 
 
@@ -2397,11 +2448,41 @@ def infer_event_upvalue_names(proto: Proto) -> dict[int, str]:
 def guess_local_function_name(child: Proto) -> str | None:
     """Best-effort readable name for an anonymous local function.
 
-    Uses the returned constructor (`return X.new(...)`) as the strongest hint,
-    which is common for BO2 UI factory helpers. Returns None when nothing
-    reliable can be inferred so the caller can fall back to a stable name.
+    BO2 retail Lua does not appear to preserve local debug names, so this uses
+    semantic bytecode evidence only: event strings passed to
+    `registerEventHandler`, returned UI constructors, and distinctive string
+    constants. Returns None when no meaningful hint exists.
     """
     insts = [inst for inst in child.instructions if inst.opname != "DATA"]
+
+    regs: dict[int, Any] = {}
+    methods: dict[int, tuple[str, str | Any]] = {}
+    for inst in insts:
+        if inst.opname == "LOADK":
+            regs[inst.a] = constant_value(child, inst.bx)
+        elif inst.opname == "GETGLOBAL":
+            regs[inst.a] = constant_name(child, inst.bx)
+        elif inst.opname in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            base = regs.get(inst.b)
+            field = constant_value(child, inst.c)
+            regs[inst.a] = field_expr(str(base), field) if base else field
+        elif inst.opname == "MOVE":
+            regs[inst.a] = regs.get(inst.b)
+        elif inst.opname == "SELF":
+            base = regs.get(inst.b)
+            method = self_field_value(child, inst.c)
+            regs[inst.a] = field_expr(str(base), method) if base else method
+            regs[inst.a + 1] = base
+            methods[inst.a] = (str(base), method)
+        elif inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+            if inst.a in methods:
+                _base, method = methods.pop(inst.a)
+                if method == "registerEventHandler" and inst.b >= 3:
+                    event_name = regs.get(inst.a + 2)
+                    if isinstance(event_name, str) and event_name:
+                        return camel_from_label(event_name, "handleEvent", "handle")
+            regs.pop(inst.a, None)
+
     returned: set[int] = set()
     for inst in insts:
         if inst.opname == "RETURN" and inst.b > 1:
@@ -2409,6 +2490,7 @@ def guess_local_function_name(child: Proto) -> str | None:
     if not returned:
         return None
     reg_expr: dict[int, str] = {}
+    constructed: dict[int, str] = {}
     for inst in insts:
         if inst.opname == "GETGLOBAL":
             reg_expr[inst.a] = constant_name(child, inst.bx)
@@ -2416,14 +2498,43 @@ def guess_local_function_name(child: Proto) -> str | None:
             base = reg_expr.get(inst.b)
             field = constant_value(child, inst.c)
             reg_expr[inst.a] = f"{base}.{field}" if base and isinstance(field, str) else ""
+        elif inst.opname == "MOVE":
+            if inst.b in constructed:
+                constructed[inst.a] = constructed[inst.b]
         elif inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
             callee = reg_expr.get(inst.a) or ""
-            if inst.a in returned and callee:
+            if callee:
                 last = callee.rsplit(".", 1)[-1]
                 owner = callee.rsplit(".", 1)[0].rsplit(".", 1)[-1] if "." in callee else ""
                 if last in {"new", "New"} and owner:
-                    return "create" + owner[:1].upper() + owner[1:]
+                    constructed[inst.a] = "create" + owner[:1].upper() + owner[1:]
+                    if inst.a in returned:
+                        return constructed[inst.a]
             reg_expr.pop(inst.a, None)
+
+    for reg in sorted(returned):
+        if reg in constructed:
+            return constructed[reg]
+
+    preferred_prefixes = (
+        "button_prompt_",
+        "menu_",
+        "aar_",
+        "cac_",
+        "league_",
+        "player_",
+        "party_",
+        "zombie_",
+    )
+    for constant in child.constants:
+        if constant.type_name != "string" or not isinstance(constant.value, str):
+            continue
+        value = constant.value.strip()
+        if len(value) < 3 or len(value) > 64:
+            continue
+        lowered = value.lower()
+        if lowered.startswith(preferred_prefixes):
+            return camel_from_label(value, "buildElement", "build")
     return None
 
 
@@ -2510,7 +2621,7 @@ def resolve_root_children(
         if not (0 <= child_index < len(proto.children)):
             continue
         guessed = guess_local_function_name(proto.children[child_index])
-        candidate = guessed or f"localFunction{counter}"
+        candidate = guessed or f"inferredFunction{counter}"
         base = candidate
         suffix = 2
         while candidate in used:
@@ -2647,10 +2758,10 @@ def build_naming(
                     names_by_path[cpath] = unique(guessed)
                 else:
                     generic_counter += 1
-                    names_by_path[cpath] = unique(f"callback{generic_counter}")
+                    names_by_path[cpath] = unique(f"inferredCallback{generic_counter}")
             else:
                 generic_counter += 1
-                names_by_path[cpath] = unique(f"callback{generic_counter}")
+                names_by_path[cpath] = unique(f"inferredCallback{generic_counter}")
 
         for child_index in range(len(parent.children)):
             cpath = (*path, child_index)
@@ -2662,7 +2773,7 @@ def build_naming(
                 elif kind == "expr":
                     resolved[upvalue_index] = str(val)
                 else:
-                    resolved[upvalue_index] = f"upvalue{upvalue_index}"
+                    resolved[upvalue_index] = f"capturedValue{upvalue_index}"
             upvalues_by_path[cpath] = resolved
 
     return names_by_path, export_by_path, upvalues_by_path
