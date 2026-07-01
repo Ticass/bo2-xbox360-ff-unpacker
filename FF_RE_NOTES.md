@@ -115,6 +115,12 @@ Lua bytecode tool status:
   `button_over`, simple boolean `TEST` branches, early returns, and root
   closure upvalue bindings. Local variable names remain inferred unless debug
   symbols or original source names are found.
+- Additional opcode recovery handles `SETLIST` array table literals,
+  `SETTABLE_S_BK` constant-key/constant-value table writes, `_BK` arithmetic
+  variants, and common generic `for` loops produced by `ipairs`/`pairs` style
+  iterators. The current MP/ZM sample set has no remaining unresolved opcode
+  comments in `ui_lua_readable`; remaining comments are control-flow `JMP`
+  shapes that still need structural recovery.
 - Xbox 360 stores Havok/T6 instruction words big-endian. The decoded fields
   match the known T6 Havok opcode packing after reversing each 4-byte
   instruction word for field extraction.

@@ -1202,14 +1202,20 @@ def read_registers(inst: Instruction) -> list[int]:
         return [inst.b]
     if op in {"SETFIELD", "SETFIELD_R1"}:
         return [inst.a, inst.c]
-    if op in {"SETTABLE", "SETTABLE_S", "SETTABLE_N"}:
+    if op in {"SETTABLE", "SETTABLE_S", "SETTABLE_S_BK", "SETTABLE_N"}:
         return [inst.a, inst.c]
+    if op == "SETLIST":
+        return [inst.a, *range(inst.a + 1, inst.a + inst.b + 1)]
     if op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1", "TAILCALL", "TAILCALL_I", "TAILCALL_C", "TAILCALL_M", "TAILCALL_I_R1"}:
         return list(range(inst.a, inst.a + max(inst.b, 1)))
+    if op == "TFORLOOP":
+        return [inst.a, inst.a + 1, inst.a + 2]
     if op == "RETURN":
         return list(range(inst.a, inst.a + max(inst.b - 1, 0)))
     if op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW", "EQ", "LT", "LE", "EQ_BK", "LT_BK", "LE_BK"}:
         return [inst.b, inst.c]
+    if op in {"ADD_BK", "SUB_BK", "MUL_BK", "DIV_BK", "MOD_BK", "POW_BK"}:
+        return [inst.c]
     return []
 
 
@@ -1235,11 +1241,17 @@ def written_register(inst: Instruction) -> int | None:
         "CALL_M",
         "CALL_I_R1",
         "ADD",
+        "ADD_BK",
         "SUB",
+        "SUB_BK",
         "MUL",
+        "MUL_BK",
         "DIV",
+        "DIV_BK",
         "MOD",
+        "MOD_BK",
         "POW",
+        "POW_BK",
         "UNM",
         "NOT",
         "NOT_R1",
@@ -1247,13 +1259,26 @@ def written_register(inst: Instruction) -> int | None:
         "CONCAT",
     }:
         return inst.a
+    if inst.opname == "TFORLOOP":
+        return inst.a + 3
     return None
 
 
 def infer_input_registers(proto: Proto) -> list[int]:
     written: set[int] = set()
     inputs: set[int] = set()
-    for inst in proto.instructions:
+    instructions = [inst for inst in proto.instructions if inst.opname != "DATA"]
+    by_index = {inst.index: inst for inst in instructions}
+    generic_loop_vars_by_jump: dict[int, list[int]] = {}
+    for pos, inst in enumerate(instructions):
+        if inst.opname == "JMP" and inst.sbx > 0:
+            target = by_index.get(inst.index + inst.sbx + 1)
+            following = instructions[pos + 1] if pos + 1 < len(instructions) else None
+            if target and target.opname == "TFORLOOP":
+                generic_loop_vars_by_jump[inst.index] = list(range(target.a + 3, target.a + 3 + max(target.c, 1)))
+    for inst in instructions:
+        if inst.index in generic_loop_vars_by_jump:
+            written.update(generic_loop_vars_by_jump[inst.index])
         for reg in read_registers(inst):
             if reg < 64 and reg not in written:
                 inputs.add(reg)
@@ -1262,6 +1287,8 @@ def infer_input_registers(proto: Proto) -> list[int]:
             written.add(target)
             if inst.opname == "SELF":
                 written.add(target + 1)
+            if inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"} and inst.c > 1:
+                written.update(range(inst.a, inst.a + inst.c - 1))
     if not inputs:
         return []
     highest = max(inputs)
@@ -1323,8 +1350,21 @@ def source_lines_for_proto(
     def table_literal(fields: list[tuple[Any, str]]) -> str:
         if not fields:
             return "{}"
-        parts = []
+        positional: dict[int, str] = {}
+        keyed: list[tuple[Any, str]] = []
         for key, value in fields:
+            if isinstance(key, int) and key > 0:
+                positional[key] = value
+            else:
+                keyed.append((key, value))
+        parts = []
+        index = 1
+        while index in positional:
+            parts.append(positional.pop(index))
+            index += 1
+        for key in sorted(positional):
+            parts.append(f"[{key}] = {positional[key]}")
+        for key, value in keyed:
             if isinstance(key, str) and is_lua_identifier(key):
                 parts.append(f"{key} = {value}")
             else:
@@ -1366,6 +1406,11 @@ def source_lines_for_proto(
     skip_indices: set[int] = set()
     structured_ifs: dict[int, tuple[Instruction, int]] = {}
     close_after: dict[int, int] = {}
+    by_index = {inst.index: inst for inst in meaningful}
+    meaningful_positions = {inst.index: pos for pos, inst in enumerate(meaningful)}
+    generic_loop_starts: dict[int, Instruction] = {}
+    generic_loop_ends: dict[int, Instruction] = {}
+    generic_iterator_calls: set[int] = set()
 
     def condition_text(inst: Instruction) -> str:
         if inst.opname in {"TEST", "TEST_R1"}:
@@ -1385,6 +1430,18 @@ def source_lines_for_proto(
             end_index = following.index + following.sbx
             structured_ifs[inst.index] = (following, end_index)
             close_after[end_index] = close_after.get(end_index, 0) + 1
+        if inst.opname == "JMP" and inst.sbx > 0:
+            target = by_index.get(inst.index + inst.sbx + 1)
+            if target and target.opname == "TFORLOOP":
+                after_target = next_meaningful.get(target.index)
+                if after_target and after_target.opname == "JMP" and after_target.sbx < 0:
+                    generic_loop_starts[inst.index] = target
+                    generic_loop_ends[target.index] = after_target
+                    previous_pos = meaningful_positions.get(inst.index, 0) - 1
+                    if previous_pos >= 0:
+                        previous = meaningful[previous_pos]
+                        if previous.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"} and previous.a == target.a:
+                            generic_iterator_calls.add(previous.index)
 
     for inst in proto.instructions:
         if inst.index in skip_indices:
@@ -1404,6 +1461,18 @@ def source_lines_for_proto(
             emit(f"if {condition} then")
             block_depth += 1
             skip_indices.add(jump_inst.index)
+            continue
+        if inst.index in generic_loop_starts:
+            tfor_inst = generic_loop_starts[inst.index]
+            iterator = expr(tfor_inst.a)
+            loop_vars = [register_name(reg) for reg in range(tfor_inst.a + 3, tfor_inst.a + 3 + max(tfor_inst.c, 1))]
+            for reg_name in loop_vars:
+                try:
+                    declared.add(int(reg_name.split("_", 1)[1]))
+                except (IndexError, ValueError):
+                    pass
+            emit(f"for {', '.join(loop_vars)} in {iterator} do")
+            block_depth += 1
             continue
         if op == "GETGLOBAL":
             regs[inst.a] = constant_name(proto, inst.bx)
@@ -1456,8 +1525,21 @@ def source_lines_for_proto(
             emit(f"{expr(inst.a)}[{rk_expr(inst.b)}] = {rk_expr(inst.c)}")
         elif op == "SETTABLE_S":
             emit(f"{expr(inst.a)}[{lua_literal(constant_value(proto, inst.b))}] = {rk_expr(inst.c)}")
+        elif op == "SETTABLE_S_BK":
+            key = constant_value(proto, inst.b)
+            value = rk_expr(inst.c)
+            if inst.a in table_fields:
+                table_fields[inst.a].append((key, value))
+                refresh_table_expr(inst.a)
+            else:
+                emit(f"{expr(inst.a)}[{lua_literal(key)}] = {value}")
         elif op == "SETTABLE_N":
             emit(f"{expr(inst.a)}[{inst.b}] = {rk_expr(inst.c)}")
+        elif op == "SETLIST":
+            start_index = ((inst.c or 1) - 1) * 50
+            for offset in range(1, inst.b + 1):
+                table_fields.setdefault(inst.a, []).append((start_index + offset, expr(inst.a + offset)))
+            refresh_table_expr(inst.a)
         elif op == "CLOSURE":
             regs[inst.a] = proto_path_name((*path, inst.bx))
         elif op == "SELF":
@@ -1477,6 +1559,9 @@ def source_lines_for_proto(
                     call_expr = f"{base}:{method_text}({', '.join(arg_regs[1:])})"
                 else:
                     call_expr = f"{field_expr(base, method)}({', '.join(arg_regs)})"
+            if inst.index in generic_iterator_calls:
+                regs[inst.a] = call_expr
+                continue
             if inst.c == 1:
                 emit(call_expr)
                 regs[inst.a] = call_expr
@@ -1505,9 +1590,11 @@ def source_lines_for_proto(
                         emit(f"return{returned}")
                 else:
                     emit(f"-- return{returned}")
-        elif op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW"}:
-            symbol = {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/", "MOD": "%", "POW": "^"}[op]
-            regs[inst.a] = f"({rk_expr(inst.b)} {symbol} {rk_expr(inst.c)})"
+        elif op in {"ADD", "ADD_BK", "SUB", "SUB_BK", "MUL", "MUL_BK", "DIV", "DIV_BK", "MOD", "MOD_BK", "POW", "POW_BK"}:
+            base_op = op.removesuffix("_BK")
+            symbol = {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/", "MOD": "%", "POW": "^"}[base_op]
+            left = lua_literal(constant_value(proto, inst.b)) if op.endswith("_BK") else rk_expr(inst.b)
+            regs[inst.a] = f"({left} {symbol} {rk_expr(inst.c)})"
         elif op in {"UNM", "NOT", "NOT_R1", "LEN"}:
             prefix = {"UNM": "-", "NOT": "not ", "NOT_R1": "not ", "LEN": "#"}[op]
             regs[inst.a] = f"{prefix}{expr(inst.b)}"
@@ -1521,6 +1608,10 @@ def source_lines_for_proto(
         elif op == "FORLOOP":
             block_depth = max(0, block_depth - 1)
             emit("end")
+        elif op == "TFORLOOP" and inst.index in generic_loop_ends:
+            block_depth = max(0, block_depth - 1)
+            emit("end")
+            skip_indices.add(generic_loop_ends[inst.index].index)
         elif op in {"JMP", "TFORLOOP", "TEST", "TEST_R1", "TESTSET", "EQ", "LT", "LE", "EQ_BK", "LT_BK", "LE_BK"}:
             emit(f"-- control flow: {readable_instruction_comment(proto, inst)[3:]}")
         else:
