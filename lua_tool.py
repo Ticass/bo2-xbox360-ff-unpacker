@@ -1894,6 +1894,24 @@ def source_lines_for_proto(
                 bool_value[inst.index] = lb1.a
                 skip_indices.update({jmp.index, lb1.index, lb2.index})
                 continue
+        if inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1", "NOT", "NOT_R1"} and pos + 3 < len(meaningful):
+            jmp, lb1, lb2 = meaningful[pos + 1], meaningful[pos + 2], meaningful[pos + 3]
+            if (
+                jmp.opname == "JMP"
+                and jmp.sbx == 2
+                and lb1.opname == "LOADBOOL"
+                and lb2.opname == "LOADBOOL"
+                and lb1.a == inst.a
+                and lb2.a == inst.a
+                and lb1.b == 0
+                and lb1.c == 1
+                and lb2.b == 1
+                and lb2.c == 0
+            ):
+                # Havok/T6 uses this after boolean-returning calls to normalize
+                # truthiness. The call expression itself is the readable value.
+                skip_indices.update({jmp.index, lb1.index, lb2.index})
+                continue
         if inst.opname == "TESTSET" and pos + 1 < len(meaningful):
             jmp = meaningful[pos + 1]
             if jmp.opname == "JMP" and jmp.sbx > 0:
@@ -1916,10 +1934,10 @@ def source_lines_for_proto(
                     andor_finalize.setdefault(target, [])
                     skip_indices.add(jmp.index)
 
-        # A JMP that lands on the very next instruction (sBx == 0) is a no-op;
+        # A JMP that lands on the very next instruction is a no-op;
         # if a bare comparison feeds only that jump, both are dead. Drop them so
         # they do not surface as `-- control flow` comments.
-        if inst.opname == "JMP" and inst.sbx == 0 and inst.index not in skip_indices:
+        if inst.opname == "JMP" and inst.sbx in {0, 1} and inst.index not in skip_indices:
             skip_indices.add(inst.index)
             if pos > 0 and meaningful[pos - 1].opname in _COMPARE_OPS and meaningful[pos - 1].index not in bool_value:
                 skip_indices.add(meaningful[pos - 1].index)
