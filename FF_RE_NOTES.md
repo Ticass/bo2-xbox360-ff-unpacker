@@ -124,7 +124,7 @@ Lua bytecode tool status:
   including call operands), boolean-valued comparisons
   (`cmp; JMP; LOADBOOL A 0 1; LOADBOOL A 1 0` -> `x = a op b`), call/`not`
   boolean-normalization sequences, and no-op `JMP sBx=0/1`. Total
-  `-- control flow` comments across the corpus fell from ~651 to 12 lines.
+  `-- control flow` comments across the corpus fell from ~651 to 10 lines.
 - Generic `for ... in` loops are now located from the TFORLOOP back edge (the
   loop-entry JMP is at back-target - 1), fixing nested loops where an inner
   forward JMP also targets the TFORLOOP (previously produced an empty
@@ -132,7 +132,7 @@ Lua bytecode tool status:
 - Reassignments from `MOVE` into already-declared locals are now emitted, which
   restores iterator updates such as `child = sibling` in `while child do` loops.
 - Remaining decompiler tail: `elseif` chains, `break`, and `repeat/until`
-  back-edges in 10 files (12 total `-- control flow` comments); anonymous
+  back-edges in 5 files (10 total `-- control flow` comments); anonymous
   inline closures hoisted as `callbackN` instead of inline `function()...end`;
   a few unrecoverable parent-local captures shown as `upvalueN`.
 - `decompile-source` now recovers meaningful parameter names with no generic
@@ -142,7 +142,7 @@ Lua bytecode tool status:
   `string`/`Localize` argument names (`text`).
 - Control-flow recovery now emits structured `if`, `if/else`, `while`, numeric
   `for`, and generic `for ... in` blocks. Current MP/ZM verification still has
-  12 `-- control flow` comments across 10 files.
+  10 `-- control flow` comments across 5 files.
 - Root child functions get one consistent name used at both the declaration and
   every upvalue reference. Open-upvalue captures to parent register slots are
   resolved via a whole-root closure pre-scan, so forward-referenced module-level

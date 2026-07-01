@@ -1510,6 +1510,37 @@ def strip_trailing_control_comments(lines: list[str]) -> list[str]:
     return lines
 
 
+def strip_empty_else_blocks(lines: list[str]) -> list[str]:
+    """Remove decompiler-only empty else clauses.
+
+    This only drops `else` when the next emitted source line at the same
+    indentation is another `else` or `end`, meaning no statement would be lost.
+    """
+    changed = True
+    result = list(lines)
+    while changed:
+        changed = False
+        filtered: list[str] = []
+        for index, line in enumerate(result):
+            if line.strip() != "else":
+                filtered.append(line)
+                continue
+            indent_len = len(line) - len(line.lstrip(" "))
+            next_line = None
+            for candidate in result[index + 1:]:
+                if candidate.strip():
+                    next_line = candidate
+                    break
+            if next_line is not None:
+                next_indent = len(next_line) - len(next_line.lstrip(" "))
+                if next_indent == indent_len and next_line.strip() in {"else", "end"}:
+                    changed = True
+                    continue
+            filtered.append(line)
+        result = filtered
+    return result
+
+
 def sanitize_local_name(value: str, fallback: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in value)
     if cleaned and cleaned[0].isdigit():
@@ -1873,6 +1904,7 @@ def source_lines_for_proto(
                         if previous.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"} and previous.a == inst.a:
                             generic_iterator_calls.add(previous.index)
 
+
     # Pass 1b: boolean-valued comparisons `R_A = a op b`, encoded as
     #   <cmp> ; JMP +1 ; LOADBOOL A 0 1 ; LOADBOOL A 1 0
     # and short-circuit `and`/`or`, encoded as
@@ -1894,11 +1926,11 @@ def source_lines_for_proto(
                 bool_value[inst.index] = lb1.a
                 skip_indices.update({jmp.index, lb1.index, lb2.index})
                 continue
-        if inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1", "NOT", "NOT_R1"} and pos + 3 < len(meaningful):
+        if inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1", "NOT", "NOT_R1", "MOVE"} and pos + 3 < len(meaningful):
             jmp, lb1, lb2 = meaningful[pos + 1], meaningful[pos + 2], meaningful[pos + 3]
             if (
                 jmp.opname == "JMP"
-                and jmp.sbx == 2
+                and jmp.sbx in {2, 6}
                 and lb1.opname == "LOADBOOL"
                 and lb2.opname == "LOADBOOL"
                 and lb1.a == inst.a
@@ -2204,7 +2236,8 @@ def source_lines_for_proto(
         else:
             emit(f"-- unresolved: {readable_instruction_comment(proto, inst)[3:]}")
 
-    return strip_trailing_control_comments(lines) or [f"{indent}-- empty function"]
+    lines = strip_empty_else_blocks(strip_trailing_control_comments(lines))
+    return lines or [f"{indent}-- empty function"]
 
 
 def proto_path_name(path: tuple[int, ...]) -> str:
