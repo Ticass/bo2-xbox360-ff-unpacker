@@ -134,6 +134,7 @@ HKS_OPCODES = [
     "GETGLOBAL_MEM",
     "MAX",
 ]
+HKS_OPCODE_BY_NAME = {name: index for index, name in enumerate(HKS_OPCODES)}
 
 
 class ParseError(ValueError):
@@ -249,6 +250,111 @@ def parse_instruction(raw: bytes, index: int, offset: int) -> Instruction:
     sbx = bx - 65536 + 1
     opname = HKS_OPCODES[opcode] if opcode < len(HKS_OPCODES) else f"OP_{opcode:02d}"
     return Instruction(index, offset, raw, opcode, opname, a, b, c_full, extra_c_bit, bx, sbx)
+
+
+def parse_int_field(value: Any, field: str, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ParseError(f"instruction field {field} must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ParseError(f"instruction field {field} out of range ({parsed}; expected {minimum}..{maximum})")
+    return parsed
+
+
+def opcode_from_edit(edited: dict[str, Any], original: Instruction) -> int:
+    if "opcode" in edited:
+        return parse_int_field(edited["opcode"], "opcode", 0, 127)
+    opname = edited.get("opname", original.opname)
+    if opname == original.opname:
+        return original.opcode
+    if isinstance(opname, str) and opname.startswith("OP_"):
+        return parse_int_field(opname[3:], "opname", 0, 127)
+    try:
+        return HKS_OPCODE_BY_NAME[str(opname)]
+    except KeyError as exc:
+        raise ParseError(f"unknown Havok opcode name {opname!r}") from exc
+
+
+def encode_instruction_fields(original: Instruction, edited: dict[str, Any]) -> bytes:
+    """Encode one Havok/T6 instruction from editable JSON fields."""
+
+    opcode = opcode_from_edit(edited, original)
+    a = parse_int_field(edited.get("a", original.a), "a", 0, 255)
+
+    edited_b = parse_int_field(edited["b"], "b", 0, 255) if "b" in edited else original.b
+    edited_c = parse_int_field(edited["c"], "c", 0, 511) if "c" in edited else original.c
+    edited_bx = parse_int_field(edited["bx"], "bx", 0, 131071) if "bx" in edited else original.bx
+    edited_sbx = parse_int_field(edited["sbx"], "sbx", -65535, 65536) if "sbx" in edited else original.sbx
+    b_changed = "b" in edited and edited_b != original.b
+    c_changed = "c" in edited and edited_c != original.c
+    bx_changed = "bx" in edited and edited_bx != original.bx
+    sbx_changed = "sbx" in edited and edited_sbx != original.sbx
+
+    if bx_changed or sbx_changed:
+        if bx_changed and sbx_changed:
+            bx_from_bx = edited_bx
+            bx_from_sbx = edited_sbx + 65536 - 1
+            if bx_from_bx != bx_from_sbx:
+                raise ParseError("instruction bx and sbx edits disagree")
+            bx = bx_from_bx
+        elif bx_changed:
+            bx = edited_bx
+        else:
+            bx = edited_sbx + 65536 - 1
+        b = bx // 512
+        c = bx % 512
+        if b_changed and edited_b != b:
+            raise ParseError("instruction b edit disagrees with bx/sbx")
+        if c_changed and edited_c != c:
+            raise ParseError("instruction c edit disagrees with bx/sbx")
+    else:
+        b = edited_b
+        c = edited_c
+
+    extra_c_bit = c >= 256
+    c_low = c & 0xFF
+    b_value = (b & 0x7F) << 1
+    if extra_c_bit:
+        b_value |= 1
+    flags_b = opcode << 1
+    if b >= 128:
+        flags_b |= 1
+    if flags_b > 0xFF:
+        raise ParseError(f"instruction opcode {opcode} cannot fit in encoded flags byte")
+
+    # parse_instruction reverses the file word before field extraction, so write
+    # the normalized packed bytes in reverse to preserve Xbox big-endian words.
+    packed = bytes([a, c_low, b_value, flags_b])
+    return packed[::-1]
+
+
+def encode_instruction_for_patch(original: Instruction, edited: dict[str, Any]) -> bytes:
+    raw_hex = str(edited.get("raw_hex", original.raw.hex())).replace(" ", "")
+    try:
+        raw_from_hex = bytes.fromhex(raw_hex)
+    except ValueError as exc:
+        raise ParseError(f"instruction {original.index} raw_hex is invalid") from exc
+    if len(raw_from_hex) != 4:
+        raise ParseError(f"instruction {original.index} raw_hex must encode exactly 4 bytes")
+
+    field_names = {"opcode", "opname", "a", "b", "c", "bx", "sbx"}
+    field_edit_requested = any(
+        name in edited and edited.get(name) != getattr(original, name, None) for name in field_names
+    )
+    raw_edit_requested = raw_from_hex != original.raw
+    if raw_edit_requested and field_edit_requested:
+        assembled = encode_instruction_fields(original, edited)
+        if assembled != raw_from_hex:
+            raise ParseError(
+                f"instruction {original.index} has conflicting raw_hex and decoded field edits"
+            )
+        return raw_from_hex
+    if raw_edit_requested:
+        return raw_from_hex
+    if field_edit_requested:
+        return encode_instruction_fields(original, edited)
+    return original.raw
 
 
 def parse_constant(data: bytes, offset: int, index: int) -> tuple[Constant, int]:
@@ -656,7 +762,7 @@ def proto_to_editable(proto: Proto) -> dict[str, Any]:
                 "c": inst.c,
                 "bx": inst.bx,
                 "sbx": inst.sbx,
-                "note": "edit raw_hex only; opcode fields are informational in this format",
+                "note": "edit opcode/opname and a/b/c or bx/sbx; raw_hex is also accepted",
             }
             for inst in proto.instructions
         ],
@@ -715,13 +821,7 @@ def apply_editable_proto(data: bytearray, current: Proto, edited: dict[str, Any]
     for inst, edited_inst in zip(current.instructions, edited_instructions):
         if int(edited_inst.get("offset", -1)) != inst.offset:
             raise ParseError(f"instruction offset mismatch at proto 0x{current.offset:X}, index {inst.index}")
-        raw_hex = str(edited_inst.get("raw_hex", inst.raw.hex())).replace(" ", "")
-        try:
-            raw = bytes.fromhex(raw_hex)
-        except ValueError as exc:
-            raise ParseError(f"instruction {inst.index} raw_hex is invalid") from exc
-        if len(raw) != 4:
-            raise ParseError(f"instruction {inst.index} raw_hex must encode exactly 4 bytes")
+        raw = encode_instruction_for_patch(inst, edited_inst)
         data[inst.offset : inst.offset + 4] = raw
 
     edited_constants = edited.get("constants", [])
@@ -936,7 +1036,7 @@ def cmd_decompile_json_dir(args: argparse.Namespace) -> int:
         "decompiled_json": count,
         "skipped_non_bytecode": skipped,
         "failed": failures,
-        "note": "Edit same-length constants or instruction raw_hex, then rebuild with recompile-json-dir.",
+        "note": "Edit same-length constants or instruction opcode/operands/raw_hex, then rebuild with recompile-json-dir.",
     }
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "decompile_json_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -1005,7 +1105,7 @@ def cmd_recompile_json_dir(args: argparse.Namespace) -> int:
         "format": "bo2-xbox-lua-edit-v1",
         "recompiled_json": count,
         "failed": failures,
-        "mode": "workspace JSON rebuild; supports same-length constants and raw instruction-byte edits",
+        "mode": "workspace JSON rebuild; supports same-length constants and decoded/raw instruction edits",
     }
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "recompile_json_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

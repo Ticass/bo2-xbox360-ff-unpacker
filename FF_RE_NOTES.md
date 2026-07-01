@@ -111,6 +111,7 @@ Lua bytecode tool status:
 - Current editable JSON rebuild support:
   - same-length string constant edits,
   - boolean/number constant edits,
+  - decoded instruction edits through `opname`, `a`, `b`, `c`, `bx`, and `sbx`,
   - raw 4-byte instruction edits through `raw_hex`.
 - The JSON compiler patches the original byte array by absolute offsets and
   validates the rebuilt payload by reparsing it. This preserves unknown Havok

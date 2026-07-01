@@ -232,7 +232,8 @@ python .\lua_tool.py recompile path\to\buttonlist.lua -o buttonlist.recompiled.l
 ```
 
 Editable JSON rebuild currently supports same-length string constant edits,
-boolean/number constant edits, and raw 4-byte instruction edits. The compiler
-patches the original byte array by offset and preserves all unknown Havok fields.
+boolean/number constant edits, decoded instruction edits (`opname`, `a`, `b`,
+`c`, `bx`, `sbx`), and raw 4-byte instruction edits. The compiler patches the
+original byte array by offset and preserves all unknown Havok fields.
 Length-changing string edits, adding/removing constants, adding/removing
 instructions, and compiling readable Lua source are not implemented yet.
