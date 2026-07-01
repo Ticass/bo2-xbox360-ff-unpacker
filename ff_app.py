@@ -16,7 +16,7 @@ from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, filedialog, messagebox, ttk
 import tkinter as tk
 
-from lua_tool import cmd_decompile_dir
+from lua_tool import cmd_decompile_asm_dir, cmd_decompile_dir, cmd_decompile_source_dir
 from xbox360_ff_unpacker import FastFileScanner, write_json
 
 
@@ -89,7 +89,18 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
     chunk_errors = decompressed_zone.get("chunk_errors", [])
     lua_decompiled = 0
     lua_decompile_out = out_dir / "ui_lua_decompiled"
+    lua_readable = 0
+    lua_readable_out = out_dir / "ui_lua_readable"
+    lua_asm = 0
+    lua_asm_out = out_dir / "ui_lua_hksasm"
     if lua_files:
+        log(f"Generating readable Lua pseudo-source for {path.name}")
+        try:
+            cmd_decompile_source_dir(SimpleNamespace(input=out_dir / "ui_lua", out=lua_readable_out))
+            manifest = json.loads((lua_readable_out / "decompile_source_manifest.json").read_text(encoding="utf-8"))
+            lua_readable = int(manifest.get("decompiled_source") or 0)
+        except Exception:
+            lua_readable = 0
         log(f"Generating Lua pseudo-decompile listings for {path.name}")
         try:
             cmd_decompile_dir(SimpleNamespace(input=out_dir / "ui_lua", out=lua_decompile_out))
@@ -97,6 +108,13 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
             lua_decompiled = int(manifest.get("decompiled") or 0)
         except Exception:
             lua_decompiled = 0
+        log(f"Generating editable Lua HKS assembly for {path.name}")
+        try:
+            cmd_decompile_asm_dir(SimpleNamespace(input=out_dir / "ui_lua", out=lua_asm_out))
+            manifest = json.loads((lua_asm_out / "decompile_asm_manifest.json").read_text(encoding="utf-8"))
+            lua_asm = int(manifest.get("decompiled_asm") or 0)
+        except Exception:
+            lua_asm = 0
     result_readme = out_dir / "README_EXTRACT_RESULT.txt"
     if scripts or lua_files:
         found_lines = [
@@ -108,7 +126,9 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
             folder_lines.extend(["Open the scripts folder for extracted .gsc/.csc payloads:", str(out_dir / "scripts"), ""])
         if lua_files:
             folder_lines.extend(["Open the ui_lua folder for extracted .lua bytecode payloads:", str(out_dir / "ui_lua"), ""])
+            folder_lines.extend(["Open the ui_lua_readable folder for readable Lua pseudo-source:", str(lua_readable_out), ""])
             folder_lines.extend(["Open the ui_lua_decompiled folder for pseudo-decompiled listings:", str(lua_decompile_out), ""])
+            folder_lines.extend(["Open the ui_lua_hksasm folder for editable Havok assembly:", str(lua_asm_out), ""])
         result_readme.write_text(
             "\n".join(
                 [
@@ -118,7 +138,8 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
                     *found_lines,
                     "",
                     *folder_lines,
-                    "Important: extracted .gsc/.csc/.lua files are compiled Xbox/Treyarch bytecode payloads, not decompiled source text yet.",
+                    "Important: extracted .gsc/.csc/.lua files are compiled Xbox/Treyarch bytecode payloads.",
+                    "Lua readable files are pseudo-source; .hksasm files are editable bytecode assembly.",
                     "",
                 ]
             ),
@@ -156,6 +177,8 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
         "scripts": scripts,
         "lua_files": lua_files,
         "lua_decompiled": lua_decompiled,
+        "lua_readable": lua_readable,
+        "lua_asm": lua_asm,
         "partial": partial,
         "readme": str(result_readme),
     }
@@ -444,6 +467,8 @@ class FastFileApp:
             _, path, result, index, total = event
             scripts = result.get("scripts", 0)
             lua_files = result.get("lua_files", 0)
+            lua_readable = result.get("lua_readable", 0)
+            lua_asm = result.get("lua_asm", 0)
             if scripts:
                 status = "Partial" if result.get("partial") else "Complete"
             elif lua_files:
@@ -456,9 +481,17 @@ class FastFileApp:
             self.results.append(result)
             self.progress_value.set((index / total) * 100)
             if scripts:
-                self.status_text.set(f"Finished {path.name}. Extracted {scripts} script and {lua_files} Lua payload(s).")
+                self.status_text.set(
+                    f"Finished {path.name}. Extracted {scripts} script, {lua_files} Lua payload(s), "
+                    f"{lua_readable} readable Lua file(s), "
+                    f"and {lua_asm} editable HKSASM file(s)."
+                )
             elif lua_files:
-                self.status_text.set(f"Finished {path.name}. Extracted {lua_files} Lua UI payload(s).")
+                self.status_text.set(
+                    f"Finished {path.name}. Extracted {lua_files} Lua UI payload(s), "
+                    f"{lua_readable} readable Lua file(s), "
+                    f"and {lua_asm} editable HKSASM file(s)."
+                )
             else:
                 self.status_text.set(f"Finished {path.name}. No GSC/CSC or Lua payloads were found.")
         elif kind == "error":

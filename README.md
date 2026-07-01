@@ -3,8 +3,9 @@
 This is a Windows-friendly Xbox 360 Black Ops 2 `.ff` unpacker. The focus is
 safe extraction and metadata, especially compiled `.gsc`/`.csc` script payloads
 and compiled Treyarch/Xbox Lua UI payloads. The Lua tool can now produce
-Havok/T6 structural pseudo-decompilation, but extracted scripts remain compiled
-game bytecode until their respective source decompilers/compilers are complete.
+readable Lua-shaped pseudo-source plus Havok/T6 structural pseudo-decompilation,
+but extracted scripts remain compiled game bytecode until their respective
+source decompilers/compilers are complete.
 
 This repository contains source code only. Built `.exe` files, game fastfiles,
 and extracted outputs are intentionally not committed.
@@ -29,6 +30,9 @@ zombie_blabla\
   embedded_lua.json
   scripts\
   ui_lua\
+  ui_lua_readable\
+  ui_lua_decompiled\
+  ui_lua_hksasm\
   assets\
 ```
 
@@ -56,6 +60,7 @@ Use **Open Selected Output** in the app to jump straight to a completed folder.
     `script_inventory_summary.json`.
 - `lua_tool.py`
   - Parses BO2 Xbox/Treyarch Lua UI bytecode.
+  - Writes readable Lua-shaped pseudo-source for menu/UI payload triage.
   - Writes structured Havok/T6 disassembly and pseudo-decompiled listings,
     including observed nested closure bodies.
   - Writes editable bytecode workspace JSON and rebuilds `.lua` bytecode from it.
@@ -149,11 +154,16 @@ FFFFFFFF <big-endian payload length> FFFFFFFF <path ending .lua>\0 <Lua bytecode
 
 The payload starts with `1B 4C 75 61` (`\x1bLua`). These files are written to
 `ui_lua\` using their original `.lua` paths, but they are compiled Xbox/Treyarch
-Lua bytecode, not readable Lua source yet.
+Lua bytecode.
 
-The app also writes pseudo-decompiled listings to `ui_lua_decompiled\`. These
-files expose constants, nested functions, and Havok/T6 opcode disassembly for
-reverse engineering. They are not yet valid editable source code.
+The app also writes:
+
+- `ui_lua_readable\`: readable Lua-shaped pseudo-source. This is valid text
+  intended for triage, not guaranteed original source.
+- `ui_lua_decompiled\`: constants, nested functions, and Havok/T6 opcode
+  disassembly for reverse engineering.
+- `ui_lua_hksasm\`: editable Havok assembly. These `.hksasm` files can be
+  rebuilt with `lua_tool.py recompile-asm` or `recompile-asm-dir`.
 
 Confirmed examples:
 
@@ -202,10 +212,22 @@ Write a pseudo-decompiled listing:
 python .\lua_tool.py decompile path\to\buttonlist.lua -o buttonlist.pseudo.lua
 ```
 
+Write readable Lua-shaped pseudo-source:
+
+```powershell
+python .\lua_tool.py decompile-source path\to\buttonlist.lua -o buttonlist.readable.lua
+```
+
 Pseudo-decompile a folder:
 
 ```powershell
 python .\lua_tool.py decompile-dir path\to\ui_lua -o path\to\ui_lua_decompiled
+```
+
+Write readable pseudo-source for a folder:
+
+```powershell
+python .\lua_tool.py decompile-source-dir path\to\ui_lua -o path\to\ui_lua_readable
 ```
 
 Write editable bytecode JSON for one payload:

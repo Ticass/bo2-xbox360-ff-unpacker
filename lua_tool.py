@@ -1056,6 +1056,240 @@ def format_constant(value: Any) -> str:
     return repr(value)
 
 
+def lua_literal(value: Any) -> str:
+    if value is None:
+        return "nil"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return format_constant(value)
+    return json.dumps(str(value))
+
+
+def constant_value(proto: Proto, index: int) -> Any:
+    if 0 <= index < len(proto.constants):
+        return proto.constants[index].value
+    return f"K_{index}"
+
+
+def constant_name(proto: Proto, index: int) -> str:
+    value = constant_value(proto, index)
+    if isinstance(value, str) and value:
+        if all(is_lua_identifier(part) for part in value.split(".")):
+            return value
+    return f"K_{index}"
+
+
+def is_lua_identifier(value: str) -> bool:
+    return value.isidentifier() and value not in {
+        "and",
+        "break",
+        "do",
+        "else",
+        "elseif",
+        "end",
+        "false",
+        "for",
+        "function",
+        "if",
+        "in",
+        "local",
+        "nil",
+        "not",
+        "or",
+        "repeat",
+        "return",
+        "then",
+        "true",
+        "until",
+        "while",
+    }
+
+
+def field_expr(base: str, field: Any) -> str:
+    if isinstance(field, str) and is_lua_identifier(field):
+        return f"{base}.{field}"
+    return f"{base}[{lua_literal(field)}]"
+
+
+def call_args(inst: Instruction, start_register: int | None = None) -> str:
+    if start_register is None:
+        start_register = inst.a + 1
+    if inst.b <= 1:
+        return "..."
+    return ", ".join(f"R[{reg}]" for reg in range(start_register, start_register + inst.b - 1))
+
+
+def approx_statement(proto: Proto, inst: Instruction, path: tuple[int, ...] = ()) -> str:
+    """Return a valid Lua-ish statement for common HKS instructions.
+
+    This is deliberately conservative: it improves readability for menu script
+    triage without claiming source equivalence. Anything with uncertain operand
+    semantics falls back to a comment with decoded fields.
+    """
+
+    op = inst.opname
+    if op == "GETGLOBAL":
+        return f"R[{inst.a}] = {constant_name(proto, inst.bx)}"
+    if op == "SETGLOBAL":
+        return f"{constant_name(proto, inst.bx)} = R[{inst.a}]"
+    if op == "MOVE":
+        return f"R[{inst.a}] = R[{inst.b}]"
+    if op == "LOADK":
+        return f"R[{inst.a}] = {lua_literal(constant_value(proto, inst.bx))}"
+    if op == "LOADBOOL":
+        return f"R[{inst.a}] = {'true' if inst.b else 'false'}"
+    if op == "LOADNIL":
+        return f"R[{inst.a}] = nil"
+    if op in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+        return f"R[{inst.a}] = {field_expr(f'R[{inst.b}]', constant_value(proto, inst.c))}"
+    if op in {"SETFIELD", "SETFIELD_R1"}:
+        return f"{field_expr(f'R[{inst.a}]', constant_value(proto, inst.b))} = R[{inst.c}]"
+    if op == "GETTABLE":
+        return f"R[{inst.a}] = R[{inst.b}][R[{inst.c}]]"
+    if op == "GETTABLE_S":
+        return f"R[{inst.a}] = R[{inst.b}][{lua_literal(constant_value(proto, inst.c))}]"
+    if op == "GETTABLE_N":
+        return f"R[{inst.a}] = R[{inst.b}][{inst.c}]"
+    if op.startswith("SETTABLE"):
+        return f"-- approx: table write {op} A={inst.a} B={inst.b} C={inst.c}"
+    if op == "NEWTABLE":
+        return f"R[{inst.a}] = {{}}"
+    if op == "CLOSURE":
+        return f"R[{inst.a}] = {proto_path_name((*path, inst.bx))}"
+    if op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+        return f"R[{inst.a}] = R[{inst.a}]({call_args(inst)})"
+    if op == "SELF":
+        return f"R[{inst.a}] = R[{inst.b}]; R[{inst.a + 1}] = R[{inst.b}][R[{inst.c}]]"
+    if op in {"TAILCALL", "TAILCALL_I", "TAILCALL_C", "TAILCALL_M", "TAILCALL_I_R1"}:
+        return f"-- return R[{inst.a}]({call_args(inst)})"
+    if op == "RETURN":
+        if inst.b <= 1:
+            return "-- return"
+        return "-- return " + ", ".join(f"R[{reg}]" for reg in range(inst.a, inst.a + inst.b - 1))
+    if op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW"}:
+        symbol = {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/", "MOD": "%", "POW": "^"}[op]
+        return f"R[{inst.a}] = R[{inst.b}] {symbol} R[{inst.c}]"
+    if op in {"UNM", "NOT", "NOT_R1", "LEN"}:
+        prefix = {"UNM": "-", "NOT": "not ", "NOT_R1": "not ", "LEN": "#"}[op]
+        return f"R[{inst.a}] = {prefix}R[{inst.b}]"
+    if op == "CONCAT":
+        return f"-- approx: R[{inst.a}] = concat R[{inst.b}]..R[{inst.c}]"
+    if op in {"JMP", "FORPREP", "FORLOOP", "TFORLOOP", "TEST", "TEST_R1", "TESTSET", "EQ", "LT", "LE"}:
+        return f"-- control flow: {op} A={inst.a} B={inst.b} C={inst.c} sBx={inst.sbx}"
+    return f"-- unresolved: {op} A={inst.a} B={inst.b} C={inst.c} Bx={inst.bx} sBx={inst.sbx}"
+
+
+def proto_path_name(path: tuple[int, ...]) -> str:
+    if not path:
+        return "chunk"
+    return "fn_" + "_".join(str(part) for part in path)
+
+
+def iter_protos(proto: Proto, path: tuple[int, ...] = ()):
+    yield path, proto
+    for child_index, child in enumerate(proto.children):
+        yield from iter_protos(child, (*path, child_index))
+
+
+def readable_instruction_comment(proto: Proto, inst: Instruction) -> str:
+    detail = ""
+    if inst.opname in {"GETGLOBAL", "SETGLOBAL", "LOADK"}:
+        detail = f" -- K[{inst.bx}]={lua_literal(constant_value(proto, inst.bx))}"
+    elif inst.opname in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+        detail = f" -- K[{inst.c}]={lua_literal(constant_value(proto, inst.c))}"
+    elif inst.opname in {"SETFIELD", "SETFIELD_R1"}:
+        detail = f" -- K[{inst.b}]={lua_literal(constant_value(proto, inst.b))}"
+    elif inst.opname == "CLOSURE":
+        detail = f" -- child[{inst.bx}]"
+    return (
+        f"-- [{inst.index:04d}] {inst.opname:<22} "
+        f"A={inst.a} B={inst.b} C={inst.c} Bx={inst.bx} sBx={inst.sbx}{detail}"
+    )
+
+
+def decompile_child_function(proto: Proto, path: tuple[int, ...]) -> list[str]:
+    name = proto_path_name(path)
+    lines = [f"local function {name}(...)"]
+    if proto.constants:
+        lines.append("  -- constants")
+        for constant in proto.constants:
+            lines.append(f"  -- K[{constant.index}] {constant.type_name} = {lua_literal(constant.value)}")
+    if proto.instructions:
+        lines.append("  local R = {}")
+        lines.append("  -- approximate statements")
+        for inst in proto.instructions:
+            lines.append(f"  {approx_statement(proto, inst, path)}")
+        lines.append("  -- bytecode")
+        for inst in proto.instructions:
+            lines.append("  " + readable_instruction_comment(proto, inst))
+    lines.append("end")
+    return lines
+
+
+def recover_root_assignments(proto: Proto) -> list[str]:
+    regs: dict[int, str] = {}
+    pending_lines: list[str] = []
+    for inst in proto.instructions:
+        if inst.opname == "GETGLOBAL":
+            regs[inst.a] = constant_name(proto, inst.bx)
+        elif inst.opname in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            base = regs.get(inst.b, f"R{inst.b}")
+            field = constant_name(proto, inst.c)
+            regs[inst.a] = f"{base}.{field}"
+        elif inst.opname == "NEWTABLE":
+            regs[inst.a] = "{}"
+        elif inst.opname == "CLOSURE":
+            regs[inst.a] = proto_path_name((inst.bx,))
+        elif inst.opname in {"SETFIELD", "SETFIELD_R1"}:
+            base = regs.get(inst.a, f"R{inst.a}")
+            field = constant_name(proto, inst.b)
+            value = regs.get(inst.c, f"R{inst.c}")
+            pending_lines.append(f"{base}.{field} = {value}")
+    return pending_lines
+
+
+def root_approx_statements(proto: Proto) -> list[str]:
+    lines = ["local R = {}"]
+    for inst in proto.instructions:
+        lines.append(approx_statement(proto, inst))
+    return lines
+
+
+def readable_lua(proto: Proto, source_name: str = "") -> str:
+    lines = [
+        "-- BO2 Xbox/Treyarch Lua readable pseudo-source",
+        "-- Generated from Havok/T6 bytecode. This is not guaranteed to match original source.",
+        "-- Unknown operations are preserved as bytecode comments.",
+    ]
+    if source_name:
+        lines.append(f"-- Source payload: {source_name}")
+    lines.append("")
+
+    for path, child in iter_protos(proto):
+        if not path:
+            continue
+        lines.extend(decompile_child_function(child, path))
+        lines.append("")
+
+    root_assignments = recover_root_assignments(proto)
+    if root_assignments:
+        lines.append("-- recovered top-level assignments")
+        lines.extend(root_assignments)
+        lines.append("")
+
+    if proto.instructions:
+        lines.append("-- root approximate statements")
+        lines.extend(root_approx_statements(proto))
+        lines.append("")
+        lines.append("-- root bytecode")
+        for inst in proto.instructions:
+            lines.append(readable_instruction_comment(proto, inst))
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def disassemble_proto(proto: Proto, indent: str = "") -> list[str]:
     lines = []
     lines.append(
@@ -1113,6 +1347,14 @@ def cmd_disasm(args: argparse.Namespace) -> int:
 def cmd_decompile(args: argparse.Namespace) -> int:
     parsed = parse_chunk(args.input)
     text = pseudo_decompile(parsed["proto"])
+    args.out.write_text(text, encoding="utf-8")
+    return 0
+
+
+def cmd_decompile_source(args: argparse.Namespace) -> int:
+    parsed = parse_chunk(args.input)
+    text = readable_lua(parsed["proto"], str(args.input))
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(text, encoding="utf-8")
     return 0
 
@@ -1177,6 +1419,39 @@ def cmd_decompile_dir(args: argparse.Namespace) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "decompile_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"decompiled {count} Lua bytecode files to {args.out}")
+    if failures:
+        print(f"failed: {len(failures)}")
+    return 0 if not failures else 1
+
+
+def cmd_decompile_source_dir(args: argparse.Namespace) -> int:
+    count = 0
+    skipped = 0
+    failures = []
+    for path in args.input.rglob("*.lua"):
+        if path.read_bytes()[:4] != b"\x1bLua":
+            skipped += 1
+            continue
+        try:
+            parsed = parse_chunk(path)
+            text = readable_lua(parsed["proto"], str(path))
+        except Exception as exc:  # noqa: BLE001 - report all files, keep going.
+            failures.append({"path": str(path), "error": str(exc)})
+            continue
+        rel = path.relative_to(args.input)
+        out_path = args.out / rel.with_suffix(".readable.lua")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+        count += 1
+    manifest = {
+        "decompiled_source": count,
+        "skipped_non_bytecode": skipped,
+        "failed": failures,
+        "mode": "readable pseudo-source; valid Lua text with bytecode comments for unresolved operations",
+    }
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "decompile_source_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {count} readable Lua files to {args.out}")
     if failures:
         print(f"failed: {len(failures)}")
     return 0 if not failures else 1
@@ -1374,6 +1649,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_decompile)
 
+    p = sub.add_parser("decompile-source", help="Write readable Lua pseudo-source")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.set_defaults(func=cmd_decompile_source)
+
     p = sub.add_parser("decompile-json", help="Write an editable bytecode workspace JSON")
     p.add_argument("input", type=Path)
     p.add_argument("-o", "--out", type=Path, required=True)
@@ -1398,6 +1678,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("input", type=Path)
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_decompile_dir)
+
+    p = sub.add_parser("decompile-source-dir", help="Write readable Lua pseudo-source for every Lua payload")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.set_defaults(func=cmd_decompile_source_dir)
 
     p = sub.add_parser("decompile-json-dir", help="Write editable bytecode workspace JSON for every Lua payload")
     p.add_argument("input", type=Path)

@@ -79,6 +79,15 @@ Treyarch/Xbox-specific Lua bytecode header bytes. The extractor writes:
 - `embedded_lua.json`
 - `assets/embedded_lua/<original lua path>`
 - `ui_lua/<original lua path>`
+- `ui_lua_readable/<original lua path>` as readable Lua-shaped pseudo-source
+- `ui_lua_decompiled/<original lua path>.pseudo.lua` as structural listings
+- `ui_lua_hksasm/<original lua path>.hksasm` as editable bytecode assembly
+
+CODResearch's BO2 Lua notes confirm that BO2 uses Lua for game menus, stores it
+as rawfile-like data, passes binary payloads to the VM, and uses the `1B 4C 75
+61` Lua magic plus a documented Havok/Treyarch opcode table. The current
+extractor's local `.lua` blob pattern is still an observed container pattern,
+not a fully proven XAsset parser.
 
 Verified counts:
 
@@ -97,6 +106,10 @@ Lua bytecode tool status:
 
 - `lua_tool.py` parses the Treyarch Lua type table, root prototype metadata,
   root instruction stream, constants, and observed nested closure bodies.
+- `lua_tool.py decompile-source` / `decompile-source-dir` write readable
+  Lua-shaped pseudo-source with recovered top-level assignments, function
+  skeletons, constants, register-based approximate statements, and decoded
+  bytecode comments for unresolved operations.
 - Xbox 360 stores Havok/T6 instruction words big-endian. The decoded fields
   match the known T6 Havok opcode packing after reversing each 4-byte
   instruction word for field extraction.
@@ -141,8 +154,8 @@ Lua bytecode tool status:
   - code starts at `align4(descriptor_start + 0x19)`.
   - constants use the same observed big-endian string-length layout.
 - Full opcode semantics, high-level control flow recovery, local/upvalue naming,
-  length-changing rewrites, and readable Lua source compilation are still
-  required before true source-level Lua round-tripping.
+  exact source recovery, length-changing rewrites, and readable Lua source
+  compilation are still required before true source-level Lua round-tripping.
 
 ## Embedded GSC/CSC extraction
 
