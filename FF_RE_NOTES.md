@@ -132,6 +132,12 @@ Lua bytecode tool status:
   `for ... do end` with the body escaping, e.g. serverlist/cacweaponslot).
 - Reassignments from `MOVE` into already-declared locals are now emitted, which
   restores iterator updates such as `child = sibling` in `while child do` loops.
+- Open-argument calls are now tracked for `CALL* B=0` after a multireturn
+  producer (`CALL* C=0`). This restores method-call arguments that were
+  previously dropped, e.g. `text:setText(Engine.Localize(...))`,
+  `image:setImage(RegisterMaterial(...))`, and `element:addElement(child)`;
+  current MP/ZM verification has zero empty `setText()`/`setImage()`/`addElement()`
+  calls.
 - Remaining decompiler tail: one observed unstructured back-edge in
   `restrictitems` is preserved as `::loop_169::` / `goto loop_169` in MP and ZM;
   anonymous inline closures are hoisted instead of inline
@@ -172,8 +178,8 @@ Lua bytecode tool status:
   decompiled source with recovered top-level assignments, function parameters,
   table constructors, method calls, recovered upvalue bindings, simple branches,
   numeric loops, and generic loops. Current MP/ZM verification has zero
-  unresolved-opcode/control-flow comments and zero duplicate function parameter
-  names.
+  unresolved-opcode/control-flow comments, zero duplicate function parameter
+  names, and zero empty common UI method calls from lost open arguments.
 - Current readable-source improvements recover root-exported function names
   such as `CoD.TextFieldButton.new`, captured event-handler locals such as
   `button_over`, simple boolean `TEST` branches, early returns, and root

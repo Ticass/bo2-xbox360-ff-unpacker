@@ -2075,6 +2075,7 @@ def source_lines_for_proto(
             block_depth += 1
 
     pending_andor: dict[int, list[tuple[int, str, str]]] = {}
+    open_call_top: int | None = None
 
     for inst in proto.instructions:
         # Close/continue any structured blocks that end at this instruction
@@ -2226,7 +2227,11 @@ def source_lines_for_proto(
             methods[inst.a] = (base, method)
         elif op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
             fn = expr(inst.a)
-            arg_regs = [expr(reg) for reg in range(inst.a + 1, inst.a + max(inst.b, 1))]
+            if inst.b == 0 and open_call_top is not None and open_call_top >= inst.a + 1:
+                arg_end = open_call_top + 1
+            else:
+                arg_end = inst.a + max(inst.b, 1)
+            arg_regs = [expr(reg) for reg in range(inst.a + 1, arg_end)]
             call_expr = f"{fn}({', '.join(arg_regs)})"
             if inst.a in methods:
                 base, method = methods.pop(inst.a)
@@ -2243,9 +2248,15 @@ def source_lines_for_proto(
                 regs[inst.a] = call_expr
             else:
                 assign(inst.a, call_expr)
+            open_call_top = inst.a if inst.c == 0 else None
         elif op in {"TAILCALL", "TAILCALL_I", "TAILCALL_C", "TAILCALL_M", "TAILCALL_I_R1"}:
-            arg_regs = [expr(reg) for reg in range(inst.a + 1, inst.a + max(inst.b, 1))]
+            if inst.b == 0 and open_call_top is not None and open_call_top >= inst.a + 1:
+                arg_end = open_call_top + 1
+            else:
+                arg_end = inst.a + max(inst.b, 1)
+            arg_regs = [expr(reg) for reg in range(inst.a + 1, arg_end)]
             emit(f"return {expr(inst.a)}({', '.join(arg_regs)})")
+            open_call_top = None
         elif op == "RETURN":
             following = next_meaningful.get(inst.index)
             if inst.b > 1 and following and following.opname == "RETURN" and following.b <= 1:
