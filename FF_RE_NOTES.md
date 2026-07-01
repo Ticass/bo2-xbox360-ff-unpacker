@@ -79,7 +79,7 @@ Treyarch/Xbox-specific Lua bytecode header bytes. The extractor writes:
 - `embedded_lua.json`
 - `assets/embedded_lua/<original lua path>`
 - `ui_lua/<original lua path>`
-- `ui_lua_readable/<original lua path>` as readable Lua-shaped pseudo-source
+- `ui_lua_readable/<original lua path>` as readable Lua decompiled source
 - `ui_lua_decompiled/<original lua path>.pseudo.lua` as structural listings
 - `ui_lua_hksasm/<original lua path>.hksasm` as editable bytecode assembly
 
@@ -106,10 +106,10 @@ Lua bytecode tool status:
 
 - `lua_tool.py` parses the Treyarch Lua type table, root prototype metadata,
   root instruction stream, constants, and observed nested closure bodies.
-- `lua_tool.py decompile-source` / `decompile-source-dir` write readable
-  Lua-shaped pseudo-source with recovered top-level assignments, function
-  skeletons, constants, register-based approximate statements, and decoded
-  bytecode comments for unresolved operations.
+- `lua_tool.py decompile-source` / `decompile-source-dir` write readable Lua
+  decompiled source with recovered top-level assignments, function parameters,
+  table constructors, method calls, upvalue placeholders, simple branches,
+  numeric loops, and comments for unresolved operations.
 - Xbox 360 stores Havok/T6 instruction words big-endian. The decoded fields
   match the known T6 Havok opcode packing after reversing each 4-byte
   instruction word for field extraction.

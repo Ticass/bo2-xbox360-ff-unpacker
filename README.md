@@ -3,7 +3,7 @@
 This is a Windows-friendly Xbox 360 Black Ops 2 `.ff` unpacker. The focus is
 safe extraction and metadata, especially compiled `.gsc`/`.csc` script payloads
 and compiled Treyarch/Xbox Lua UI payloads. The Lua tool can now produce
-readable Lua-shaped pseudo-source plus Havok/T6 structural pseudo-decompilation,
+readable Lua decompiled source plus Havok/T6 structural pseudo-decompilation,
 but extracted scripts remain compiled game bytecode until their respective
 source decompilers/compilers are complete.
 
@@ -63,7 +63,7 @@ readable/decompiled Lua folders.
     `script_inventory_summary.json`.
 - `lua_tool.py`
   - Parses BO2 Xbox/Treyarch Lua UI bytecode.
-  - Writes readable Lua-shaped pseudo-source for menu/UI payload triage.
+  - Writes readable Lua decompiled source for menu/UI payload triage.
   - Writes structured Havok/T6 disassembly and pseudo-decompiled listings,
     including observed nested closure bodies.
   - Writes editable bytecode workspace JSON and rebuilds `.lua` bytecode from it.
@@ -161,8 +161,8 @@ Lua bytecode.
 
 The app also writes:
 
-- `ui_lua_readable\`: readable Lua-shaped pseudo-source. This is valid text
-  intended for triage, not guaranteed original source.
+- `ui_lua_readable\`: readable Lua decompiled source with inferred local names
+  and recovered table constructors, method calls, simple branches, and loops.
 - `ui_lua_decompiled\`: constants, nested functions, and Havok/T6 opcode
   disassembly for reverse engineering.
 - `ui_lua_hksasm\`: editable Havok assembly. These `.hksasm` files can be
@@ -215,7 +215,7 @@ Write a pseudo-decompiled listing:
 python .\lua_tool.py decompile path\to\buttonlist.lua -o buttonlist.pseudo.lua
 ```
 
-Write readable Lua-shaped pseudo-source:
+Write readable Lua decompiled source:
 
 ```powershell
 python .\lua_tool.py decompile-source path\to\buttonlist.lua -o buttonlist.readable.lua
@@ -227,7 +227,7 @@ Pseudo-decompile a folder:
 python .\lua_tool.py decompile-dir path\to\ui_lua -o path\to\ui_lua_decompiled
 ```
 
-Write readable pseudo-source for a folder:
+Write readable decompiled source for a folder:
 
 ```powershell
 python .\lua_tool.py decompile-source-dir path\to\ui_lua -o path\to\ui_lua_readable

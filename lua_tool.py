@@ -1112,6 +1112,16 @@ def field_expr(base: str, field: Any) -> str:
     return f"{base}[{lua_literal(field)}]"
 
 
+def self_field_value(proto: Proto, index: int) -> Any:
+    if index >= 256:
+        index -= 256
+    return constant_value(proto, index)
+
+
+def rk_constant_index(index: int) -> int | None:
+    return index - 256 if index >= 256 else None
+
+
 def call_args(inst: Instruction, start_register: int | None = None) -> str:
     if start_register is None:
         start_register = inst.a + 1
@@ -1180,6 +1190,320 @@ def approx_statement(proto: Proto, inst: Instruction, path: tuple[int, ...] = ()
     return f"-- unresolved: {op} A={inst.a} B={inst.b} C={inst.c} Bx={inst.bx} sBx={inst.sbx}"
 
 
+def register_name(index: int) -> str:
+    return f"local_{index}"
+
+
+def read_registers(inst: Instruction) -> list[int]:
+    op = inst.opname
+    if op in {"MOVE", "UNM", "NOT", "NOT_R1", "LEN"}:
+        return [inst.b]
+    if op in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM", "GETTABLE", "GETTABLE_S", "GETTABLE_N", "SELF"}:
+        return [inst.b]
+    if op in {"SETFIELD", "SETFIELD_R1"}:
+        return [inst.a, inst.c]
+    if op in {"SETTABLE", "SETTABLE_S", "SETTABLE_N"}:
+        return [inst.a, inst.c]
+    if op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1", "TAILCALL", "TAILCALL_I", "TAILCALL_C", "TAILCALL_M", "TAILCALL_I_R1"}:
+        return list(range(inst.a, inst.a + max(inst.b, 1)))
+    if op == "RETURN":
+        return list(range(inst.a, inst.a + max(inst.b - 1, 0)))
+    if op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW", "EQ", "LT", "LE", "EQ_BK", "LT_BK", "LE_BK"}:
+        return [inst.b, inst.c]
+    return []
+
+
+def written_register(inst: Instruction) -> int | None:
+    if inst.opname in {
+        "GETGLOBAL",
+        "MOVE",
+        "LOADK",
+        "LOADBOOL",
+        "LOADNIL",
+        "GETFIELD",
+        "GETFIELD_R1",
+        "GETFIELD_MM",
+        "GETTABLE",
+        "GETTABLE_S",
+        "GETTABLE_N",
+        "NEWTABLE",
+        "CLOSURE",
+        "SELF",
+        "CALL",
+        "CALL_I",
+        "CALL_C",
+        "CALL_M",
+        "CALL_I_R1",
+        "ADD",
+        "SUB",
+        "MUL",
+        "DIV",
+        "MOD",
+        "POW",
+        "UNM",
+        "NOT",
+        "NOT_R1",
+        "LEN",
+        "CONCAT",
+    }:
+        return inst.a
+    return None
+
+
+def infer_input_registers(proto: Proto) -> list[int]:
+    written: set[int] = set()
+    inputs: set[int] = set()
+    for inst in proto.instructions:
+        for reg in read_registers(inst):
+            if reg < 64 and reg not in written:
+                inputs.add(reg)
+        target = written_register(inst)
+        if target is not None:
+            written.add(target)
+            if inst.opname == "SELF":
+                written.add(target + 1)
+    if not inputs:
+        return []
+    highest = max(inputs)
+    return list(range(highest + 1))
+
+
+def source_params(proto: Proto, infer: bool = False) -> list[str]:
+    count = proto.param_count
+    if infer:
+        count = max(count, len(infer_input_registers(proto)))
+    if count <= 0:
+        return ["..."]
+    return [f"arg{index}" for index in range(count)]
+
+
+def strip_trailing_control_comments(lines: list[str]) -> list[str]:
+    while lines and lines[-1].strip() in {"-- return", "return"}:
+        lines.pop()
+    return lines
+
+
+def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str = "  ", infer_params: bool = False) -> list[str]:
+    regs: dict[int, str] = {}
+    methods: dict[int, tuple[str, Any]] = {}
+    table_fields: dict[int, list[tuple[Any, str]]] = {}
+    declared: set[int] = set()
+    lines: list[str] = []
+    params = source_params(proto, infer=infer_params)
+    param_registers = {index for index, name in enumerate(params) if name != "..."}
+    for index, name in enumerate(params):
+        if name != "...":
+            regs[index] = name
+
+    def expr(reg: int) -> str:
+        return regs.get(reg, register_name(reg))
+
+    def rk_expr(index: int) -> str:
+        const_index = rk_constant_index(index)
+        if const_index is not None:
+            return lua_literal(constant_value(proto, const_index))
+        return expr(index)
+
+    def table_literal(fields: list[tuple[Any, str]]) -> str:
+        if not fields:
+            return "{}"
+        parts = []
+        for key, value in fields:
+            if isinstance(key, str) and is_lua_identifier(key):
+                parts.append(f"{key} = {value}")
+            else:
+                parts.append(f"[{lua_literal(key)}] = {value}")
+        return "{ " + ", ".join(parts) + " }"
+
+    def refresh_table_expr(reg: int) -> None:
+        if reg in table_fields:
+            regs[reg] = table_literal(table_fields[reg])
+
+    block_depth = 0
+
+    def emit(text: str) -> None:
+        lines.append(f"{indent}{'  ' * block_depth}{text}")
+
+    def assign(reg: int, value: str, force_local: bool = False) -> None:
+        if force_local or reg not in declared:
+            declared.add(reg)
+            emit(f"local {register_name(reg)} = {value}")
+        else:
+            emit(f"{register_name(reg)} = {value}")
+        regs[reg] = register_name(reg)
+
+    def emit_param_update(reg: int) -> None:
+        if block_depth > 0 and reg in param_registers:
+            emit(f"{params[reg]} = {expr(reg)}")
+            regs[reg] = params[reg]
+
+    meaningful = [inst for inst in proto.instructions if inst.opname != "DATA"]
+    last_meaningful_index = meaningful[-1].index if meaningful else -1
+    returned_registers: set[int] = set()
+    for inst in meaningful:
+        if inst.opname == "RETURN" and inst.b > 1:
+            returned_registers.update(range(inst.a, inst.a + inst.b - 1))
+    next_meaningful: dict[int, Instruction | None] = {}
+    for pos, inst in enumerate(meaningful):
+        next_meaningful[inst.index] = meaningful[pos + 1] if pos + 1 < len(meaningful) else None
+    skip_indices: set[int] = set()
+    structured_ifs: dict[int, tuple[Instruction, int]] = {}
+    close_after: dict[int, int] = {}
+
+    def condition_text(inst: Instruction) -> str:
+        op_symbol = {"EQ": "==", "EQ_BK": "==", "LT": "<", "LT_BK": "<", "LE": "<=", "LE_BK": "<="}.get(inst.opname, "==")
+        left = rk_expr(inst.b)
+        right = rk_expr(inst.c)
+        condition = f"{left} {op_symbol} {right}"
+        if inst.a != 0:
+            condition = f"not ({condition})"
+        return condition
+
+    for inst in meaningful:
+        following = next_meaningful.get(inst.index)
+        if inst.opname in {"EQ", "EQ_BK", "LT", "LT_BK", "LE", "LE_BK"} and following and following.opname == "JMP" and following.sbx > 0:
+            end_index = following.index + following.sbx
+            structured_ifs[inst.index] = (following, end_index)
+            close_after[end_index] = close_after.get(end_index, 0) + 1
+
+    for inst in proto.instructions:
+        if inst.index in skip_indices:
+            for _ in range(close_after.get(inst.index, 0)):
+                block_depth = max(0, block_depth - 1)
+                emit("end")
+            continue
+        op = inst.opname
+        if op == "DATA":
+            for _ in range(close_after.get(inst.index, 0)):
+                block_depth = max(0, block_depth - 1)
+                emit("end")
+            continue
+        if inst.index in structured_ifs:
+            jump_inst, _ = structured_ifs[inst.index]
+            condition = condition_text(inst)
+            emit(f"if {condition} then")
+            block_depth += 1
+            skip_indices.add(jump_inst.index)
+            continue
+        if op == "GETGLOBAL":
+            regs[inst.a] = constant_name(proto, inst.bx)
+            emit_param_update(inst.a)
+        elif op == "SETGLOBAL":
+            emit(f"{constant_name(proto, inst.bx)} = {expr(inst.a)}")
+        elif op == "GETUPVAL":
+            regs[inst.a] = f"upvalue_{inst.b}"
+        elif op in {"SETUPVAL", "SETUPVAL_R1"}:
+            emit(f"upvalue_{inst.b} = {expr(inst.a)}")
+        elif op == "MOVE":
+            regs[inst.a] = expr(inst.b)
+            emit_param_update(inst.a)
+        elif op == "LOADK":
+            regs[inst.a] = lua_literal(constant_value(proto, inst.bx))
+            if block_depth == 0 and inst.a in returned_registers and inst.a not in declared:
+                assign(inst.a, regs[inst.a])
+            else:
+                emit_param_update(inst.a)
+        elif op == "LOADBOOL":
+            regs[inst.a] = "true" if inst.b else "false"
+            emit_param_update(inst.a)
+        elif op == "LOADNIL":
+            regs[inst.a] = "nil"
+            emit_param_update(inst.a)
+        elif op == "NEWTABLE":
+            regs[inst.a] = "{}"
+            table_fields[inst.a] = []
+        elif op in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            regs[inst.a] = field_expr(expr(inst.b), constant_value(proto, inst.c))
+            emit_param_update(inst.a)
+        elif op in {"SETFIELD", "SETFIELD_R1"}:
+            value = rk_expr(inst.c)
+            if inst.a in table_fields:
+                table_fields[inst.a].append((constant_value(proto, inst.b), value))
+                refresh_table_expr(inst.a)
+            else:
+                emit(f"{field_expr(expr(inst.a), constant_value(proto, inst.b))} = {value}")
+        elif op == "GETTABLE":
+            regs[inst.a] = f"{expr(inst.b)}[{expr(inst.c)}]"
+        elif op == "GETTABLE_S":
+            regs[inst.a] = f"{expr(inst.b)}[{lua_literal(constant_value(proto, inst.c))}]"
+        elif op == "GETTABLE_N":
+            regs[inst.a] = f"{expr(inst.b)}[{inst.c}]"
+        elif op == "SETTABLE":
+            emit(f"{expr(inst.a)}[{rk_expr(inst.b)}] = {rk_expr(inst.c)}")
+        elif op == "SETTABLE_S":
+            emit(f"{expr(inst.a)}[{lua_literal(constant_value(proto, inst.b))}] = {rk_expr(inst.c)}")
+        elif op == "SETTABLE_N":
+            emit(f"{expr(inst.a)}[{inst.b}] = {rk_expr(inst.c)}")
+        elif op == "CLOSURE":
+            regs[inst.a] = proto_path_name((*path, inst.bx))
+        elif op == "SELF":
+            base = expr(inst.b)
+            method = self_field_value(proto, inst.c)
+            regs[inst.a] = field_expr(base, method)
+            regs[inst.a + 1] = base
+            methods[inst.a] = (base, method)
+        elif op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+            fn = expr(inst.a)
+            arg_regs = [expr(reg) for reg in range(inst.a + 1, inst.a + max(inst.b, 1))]
+            call_expr = f"{fn}({', '.join(arg_regs)})"
+            if inst.a in methods:
+                base, method = methods.pop(inst.a)
+                method_text = method if isinstance(method, str) and is_lua_identifier(method) else lua_literal(method)
+                if isinstance(method_text, str) and is_lua_identifier(method_text):
+                    call_expr = f"{base}:{method_text}({', '.join(arg_regs[1:])})"
+                else:
+                    call_expr = f"{field_expr(base, method)}({', '.join(arg_regs)})"
+            if inst.c == 1:
+                emit(call_expr)
+                regs[inst.a] = call_expr
+            else:
+                assign(inst.a, call_expr)
+        elif op in {"TAILCALL", "TAILCALL_I", "TAILCALL_C", "TAILCALL_M", "TAILCALL_I_R1"}:
+            arg_regs = [expr(reg) for reg in range(inst.a + 1, inst.a + max(inst.b, 1))]
+            emit(f"return {expr(inst.a)}({', '.join(arg_regs)})")
+        elif op == "RETURN":
+            following = next_meaningful.get(inst.index)
+            if inst.b > 1 and following and following.opname == "RETURN" and following.b <= 1:
+                returned = ", ".join(expr(reg) for reg in range(inst.a, inst.a + inst.b - 1))
+                emit(f"return {returned}")
+                skip_indices.add(following.index)
+            elif inst.index == last_meaningful_index:
+                if inst.b <= 1:
+                    emit("return")
+                else:
+                    returned = ", ".join(expr(reg) for reg in range(inst.a, inst.a + inst.b - 1))
+                    emit(f"return {returned}")
+            else:
+                returned = "" if inst.b <= 1 else " " + ", ".join(expr(reg) for reg in range(inst.a, inst.a + inst.b - 1))
+                emit(f"-- return{returned}")
+        elif op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW"}:
+            symbol = {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/", "MOD": "%", "POW": "^"}[op]
+            regs[inst.a] = f"({rk_expr(inst.b)} {symbol} {rk_expr(inst.c)})"
+        elif op in {"UNM", "NOT", "NOT_R1", "LEN"}:
+            prefix = {"UNM": "-", "NOT": "not ", "NOT_R1": "not ", "LEN": "#"}[op]
+            regs[inst.a] = f"{prefix}{expr(inst.b)}"
+        elif op == "CONCAT":
+            regs[inst.a] = " .. ".join(expr(reg) for reg in range(inst.b, inst.c + 1))
+            if inst.a in declared:
+                assign(inst.a, regs[inst.a])
+        elif op == "FORPREP":
+            emit(f"for {register_name(inst.a + 3)} = {expr(inst.a)}, {expr(inst.a + 1)}, {expr(inst.a + 2)} do")
+            block_depth += 1
+        elif op == "FORLOOP":
+            block_depth = max(0, block_depth - 1)
+            emit("end")
+        elif op in {"JMP", "TFORLOOP", "TEST", "TEST_R1", "TESTSET", "EQ", "LT", "LE", "EQ_BK", "LT_BK", "LE_BK"}:
+            emit(f"-- control flow: {readable_instruction_comment(proto, inst)[3:]}")
+        else:
+            emit(f"-- unresolved: {readable_instruction_comment(proto, inst)[3:]}")
+
+        for _ in range(close_after.get(inst.index, 0)):
+            block_depth = max(0, block_depth - 1)
+            emit("end")
+
+    return strip_trailing_control_comments(lines) or [f"{indent}-- empty function"]
+
+
 def proto_path_name(path: tuple[int, ...]) -> str:
     if not path:
         return "chunk"
@@ -1210,19 +1534,10 @@ def readable_instruction_comment(proto: Proto, inst: Instruction) -> str:
 
 def decompile_child_function(proto: Proto, path: tuple[int, ...]) -> list[str]:
     name = proto_path_name(path)
-    lines = [f"local function {name}(...)"]
-    if proto.constants:
-        lines.append("  -- constants")
-        for constant in proto.constants:
-            lines.append(f"  -- K[{constant.index}] {constant.type_name} = {lua_literal(constant.value)}")
+    params = ", ".join(source_params(proto, infer=True))
+    lines = [f"local function {name}({params})"]
     if proto.instructions:
-        lines.append("  local R = {}")
-        lines.append("  -- approximate statements")
-        for inst in proto.instructions:
-            lines.append(f"  {approx_statement(proto, inst, path)}")
-        lines.append("  -- bytecode")
-        for inst in proto.instructions:
-            lines.append("  " + readable_instruction_comment(proto, inst))
+        lines.extend(source_lines_for_proto(proto, path, "  ", infer_params=True))
     lines.append("end")
     return lines
 
@@ -1258,9 +1573,8 @@ def root_approx_statements(proto: Proto) -> list[str]:
 
 def readable_lua(proto: Proto, source_name: str = "") -> str:
     lines = [
-        "-- BO2 Xbox/Treyarch Lua readable pseudo-source",
-        "-- Generated from Havok/T6 bytecode. This is not guaranteed to match original source.",
-        "-- Unknown operations are preserved as bytecode comments.",
+        "-- BO2 Xbox/Treyarch Lua decompile",
+        "-- Decompiled from Havok/T6 bytecode. Some branch structure and local names are inferred.",
     ]
     if source_name:
         lines.append(f"-- Source payload: {source_name}")
@@ -1272,19 +1586,8 @@ def readable_lua(proto: Proto, source_name: str = "") -> str:
         lines.extend(decompile_child_function(child, path))
         lines.append("")
 
-    root_assignments = recover_root_assignments(proto)
-    if root_assignments:
-        lines.append("-- recovered top-level assignments")
-        lines.extend(root_assignments)
-        lines.append("")
-
     if proto.instructions:
-        lines.append("-- root approximate statements")
-        lines.extend(root_approx_statements(proto))
-        lines.append("")
-        lines.append("-- root bytecode")
-        for inst in proto.instructions:
-            lines.append(readable_instruction_comment(proto, inst))
+        lines.extend(source_lines_for_proto(proto, (), ""))
 
     lines.append("")
     return "\n".join(lines)

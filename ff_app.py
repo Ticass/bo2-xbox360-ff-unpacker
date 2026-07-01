@@ -94,7 +94,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
     lua_asm = 0
     lua_asm_out = out_dir / "ui_lua_hksasm"
     if lua_files:
-        log(f"Generating readable Lua pseudo-source for {path.name}")
+        log(f"Generating readable Lua decompile for {path.name}")
         try:
             cmd_decompile_source_dir(SimpleNamespace(input=out_dir / "ui_lua", out=lua_readable_out))
             manifest = json.loads((lua_readable_out / "decompile_source_manifest.json").read_text(encoding="utf-8"))
@@ -126,7 +126,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
             folder_lines.extend(["Open the scripts folder for extracted .gsc/.csc payloads:", str(out_dir / "scripts"), ""])
         if lua_files:
             folder_lines.extend(["Open the ui_lua folder for extracted .lua bytecode payloads:", str(out_dir / "ui_lua"), ""])
-            folder_lines.extend(["Open the ui_lua_readable folder for readable Lua pseudo-source:", str(lua_readable_out), ""])
+            folder_lines.extend(["Open the ui_lua_readable folder for readable Lua decompile:", str(lua_readable_out), ""])
             folder_lines.extend(["Open the ui_lua_decompiled folder for pseudo-decompiled listings:", str(lua_decompile_out), ""])
             folder_lines.extend(["Open the ui_lua_hksasm folder for editable Havok assembly:", str(lua_asm_out), ""])
         result_readme.write_text(
@@ -139,7 +139,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
                     "",
                     *folder_lines,
                     "Important: extracted .gsc/.csc/.lua files are compiled Xbox/Treyarch bytecode payloads.",
-                    "Lua readable files are pseudo-source; .hksasm files are editable bytecode assembly.",
+                    "Lua readable files are decompiled source with inferred local names/control flow; .hksasm files are editable bytecode assembly.",
                     "",
                 ]
             ),
