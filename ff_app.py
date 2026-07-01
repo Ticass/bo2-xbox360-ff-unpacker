@@ -11,10 +11,12 @@ import struct
 import sys
 import threading
 import traceback
+from types import SimpleNamespace
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, filedialog, messagebox, ttk
 import tkinter as tk
 
+from lua_tool import cmd_decompile_dir
 from xbox360_ff_unpacker import FastFileScanner, write_json
 
 
@@ -85,6 +87,16 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
     lua_files = decompressed_zone.get("embedded_lua", {}).get("count", 0)
     partial = decompressed_zone.get("partial_zone", False)
     chunk_errors = decompressed_zone.get("chunk_errors", [])
+    lua_decompiled = 0
+    lua_decompile_out = out_dir / "ui_lua_decompiled"
+    if lua_files:
+        log(f"Generating Lua pseudo-decompile listings for {path.name}")
+        try:
+            cmd_decompile_dir(SimpleNamespace(input=out_dir / "ui_lua", out=lua_decompile_out))
+            manifest = json.loads((lua_decompile_out / "decompile_manifest.json").read_text(encoding="utf-8"))
+            lua_decompiled = int(manifest.get("decompiled") or 0)
+        except Exception:
+            lua_decompiled = 0
     result_readme = out_dir / "README_EXTRACT_RESULT.txt"
     if scripts or lua_files:
         found_lines = [
@@ -96,6 +108,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
             folder_lines.extend(["Open the scripts folder for extracted .gsc/.csc payloads:", str(out_dir / "scripts"), ""])
         if lua_files:
             folder_lines.extend(["Open the ui_lua folder for extracted .lua bytecode payloads:", str(out_dir / "ui_lua"), ""])
+            folder_lines.extend(["Open the ui_lua_decompiled folder for pseudo-decompiled listings:", str(lua_decompile_out), ""])
         result_readme.write_text(
             "\n".join(
                 [
@@ -142,6 +155,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
         "metadata": str(metadata_path),
         "scripts": scripts,
         "lua_files": lua_files,
+        "lua_decompiled": lua_decompiled,
         "partial": partial,
         "readme": str(result_readme),
     }

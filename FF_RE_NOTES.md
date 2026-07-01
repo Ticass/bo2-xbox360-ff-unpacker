@@ -93,6 +93,26 @@ Example extracted paths:
 - `patch_ui_mp/ui_lua/ui/t6/cod9button.lua`
 - `patch_ui_mp/ui_lua/ui_mp/t6/menus/publicgamelobby.lua`
 
+Lua bytecode tool status:
+
+- `lua_tool.py` parses the Treyarch Lua type table, root prototype metadata,
+  root instruction stream, constants, and enough debug/tail data to produce
+  structural pseudo-decompiled listings.
+- `lua_tool.py recompile` and `recompile-dir` currently perform lossless
+  bytecode re-emission. This is useful for repack testing but is not editable
+  source compilation yet.
+- Root prototype header observed so far:
+  - source string
+  - little-endian line-defined / last-line-defined fields
+  - three one-byte metadata fields
+  - big-endian 16-bit instruction count
+  - one-byte max-stack
+  - 4-byte big-endian instructions
+- Nested prototypes appear to have an additional/custom preamble or hash/id
+  field before their body. Example: `textfieldbutton.lua` child data begins
+  with `BD 80 50 A1`. Full nested prototype decoding and opcode semantics are
+  still required before true editable source decompilation/recompilation.
+
 ## Embedded GSC/CSC extraction
 
 Observed Xbox compiled script blobs can be recovered by a local self-describing

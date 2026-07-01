@@ -53,6 +53,11 @@ Use **Open Selected Output** in the app to jump straight to a completed folder.
   - Aggregates every `*_ff_scan/embedded_scripts.json`.
   - Writes `script_inventory.tsv`, `script_inventory.json`, and
     `script_inventory_summary.json`.
+- `lua_tool.py`
+  - Parses BO2 Xbox/Treyarch Lua UI bytecode.
+  - Writes structured disassembly and pseudo-decompiled listings.
+  - Re-emits compiled Lua bytecode losslessly for recompile/repack testing.
+  - Editable Lua source decompilation/recompilation is not complete yet.
 - `ff_dashboard.py`
   - Starts a local browser dashboard for browsing scans, script payloads,
     hashes, fastfiles, and partial-scan warnings.
@@ -141,6 +146,10 @@ The payload starts with `1B 4C 75 61` (`\x1bLua`). These files are written to
 `ui_lua\` using their original `.lua` paths, but they are compiled Xbox/Treyarch
 Lua bytecode, not readable Lua source yet.
 
+The app also writes pseudo-decompiled listings to `ui_lua_decompiled\`. These
+files expose constants and provisional opcode disassembly for reverse
+engineering. They are not yet valid editable source code.
+
 Confirmed examples:
 
 - `patch_ui_zm.ff`: `47` Lua UI payloads extracted.
@@ -173,3 +182,33 @@ For Lua UI extraction testing, use:
 
 - `patch_ui_mp.ff`
 - `patch_ui_zm.ff`
+
+## Lua decompile/recompile tooling
+
+Disassemble one compiled Lua payload:
+
+```powershell
+python .\lua_tool.py disasm path\to\buttonlist.lua -o buttonlist.disasm.txt --json buttonlist.json
+```
+
+Write a pseudo-decompiled listing:
+
+```powershell
+python .\lua_tool.py decompile path\to\buttonlist.lua -o buttonlist.pseudo.lua
+```
+
+Pseudo-decompile a folder:
+
+```powershell
+python .\lua_tool.py decompile-dir path\to\ui_lua -o path\to\ui_lua_decompiled
+```
+
+Losslessly re-emit compiled bytecode:
+
+```powershell
+python .\lua_tool.py recompile path\to\buttonlist.lua -o buttonlist.recompiled.lua
+```
+
+Lossless recompile currently means byte-for-byte re-emission of existing BO2 Lua
+bytecode. Compiling edited readable Lua source back into Treyarch bytecode still
+requires finishing the opcode/prototype mapping.
