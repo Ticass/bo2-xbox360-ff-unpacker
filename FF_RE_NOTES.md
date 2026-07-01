@@ -108,8 +108,13 @@ Lua bytecode tool status:
   root instruction stream, constants, and observed nested closure bodies.
 - `lua_tool.py decompile-source` / `decompile-source-dir` write readable Lua
   decompiled source with recovered top-level assignments, function parameters,
-  table constructors, method calls, upvalue placeholders, simple branches,
+  table constructors, method calls, recovered upvalue bindings, simple branches,
   numeric loops, and comments for unresolved operations.
+- Current readable-source improvements recover root-exported function names
+  such as `CoD.TextFieldButton.new`, captured event-handler locals such as
+  `button_over`, simple boolean `TEST` branches, early returns, and root
+  closure upvalue bindings. Local variable names remain inferred unless debug
+  symbols or original source names are found.
 - Xbox 360 stores Havok/T6 instruction words big-endian. The decoded fields
   match the known T6 Havok opcode packing after reversing each 4-byte
   instruction word for field extraction.

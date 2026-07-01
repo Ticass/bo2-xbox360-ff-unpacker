@@ -1283,7 +1283,21 @@ def strip_trailing_control_comments(lines: list[str]) -> list[str]:
     return lines
 
 
-def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str = "  ", infer_params: bool = False) -> list[str]:
+def sanitize_local_name(value: str, fallback: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in value)
+    if cleaned and cleaned[0].isdigit():
+        cleaned = "_" + cleaned
+    return cleaned if is_lua_identifier(cleaned) else fallback
+
+
+def source_lines_for_proto(
+    proto: Proto,
+    path: tuple[int, ...] = (),
+    indent: str = "  ",
+    infer_params: bool = False,
+    skip_assigned_values: set[str] | None = None,
+    upvalue_names: dict[int, str] | None = None,
+) -> list[str]:
     regs: dict[int, str] = {}
     methods: dict[int, tuple[str, Any]] = {}
     table_fields: dict[int, list[tuple[Any, str]]] = {}
@@ -1291,6 +1305,8 @@ def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str
     lines: list[str] = []
     params = source_params(proto, infer=infer_params)
     param_registers = {index for index, name in enumerate(params) if name != "..."}
+    skip_assigned_values = skip_assigned_values or set()
+    upvalue_names = upvalue_names or {}
     for index, name in enumerate(params):
         if name != "...":
             regs[index] = name
@@ -1326,8 +1342,9 @@ def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str
 
     def assign(reg: int, value: str, force_local: bool = False) -> None:
         if force_local or reg not in declared:
-            declared.add(reg)
             emit(f"local {register_name(reg)} = {value}")
+            if block_depth == 0:
+                declared.add(reg)
         else:
             emit(f"{register_name(reg)} = {value}")
         regs[reg] = register_name(reg)
@@ -1351,6 +1368,9 @@ def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str
     close_after: dict[int, int] = {}
 
     def condition_text(inst: Instruction) -> str:
+        if inst.opname in {"TEST", "TEST_R1"}:
+            value = expr(inst.a)
+            return value if inst.c == 0 else f"not {value}"
         op_symbol = {"EQ": "==", "EQ_BK": "==", "LT": "<", "LT_BK": "<", "LE": "<=", "LE_BK": "<="}.get(inst.opname, "==")
         left = rk_expr(inst.b)
         right = rk_expr(inst.c)
@@ -1361,7 +1381,7 @@ def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str
 
     for inst in meaningful:
         following = next_meaningful.get(inst.index)
-        if inst.opname in {"EQ", "EQ_BK", "LT", "LT_BK", "LE", "LE_BK"} and following and following.opname == "JMP" and following.sbx > 0:
+        if inst.opname in {"EQ", "EQ_BK", "LT", "LT_BK", "LE", "LE_BK", "TEST", "TEST_R1"} and following and following.opname == "JMP" and following.sbx > 0:
             end_index = following.index + following.sbx
             structured_ifs[inst.index] = (following, end_index)
             close_after[end_index] = close_after.get(end_index, 0) + 1
@@ -1389,11 +1409,13 @@ def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str
             regs[inst.a] = constant_name(proto, inst.bx)
             emit_param_update(inst.a)
         elif op == "SETGLOBAL":
-            emit(f"{constant_name(proto, inst.bx)} = {expr(inst.a)}")
+            value = expr(inst.a)
+            if value not in skip_assigned_values:
+                emit(f"{constant_name(proto, inst.bx)} = {value}")
         elif op == "GETUPVAL":
-            regs[inst.a] = f"upvalue_{inst.b}"
+            regs[inst.a] = upvalue_names.get(inst.b, f"upvalue_{inst.b}")
         elif op in {"SETUPVAL", "SETUPVAL_R1"}:
-            emit(f"upvalue_{inst.b} = {expr(inst.a)}")
+            emit(f"{upvalue_names.get(inst.b, f'upvalue_{inst.b}')} = {expr(inst.a)}")
         elif op == "MOVE":
             regs[inst.a] = expr(inst.b)
             emit_param_update(inst.a)
@@ -1420,6 +1442,8 @@ def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str
             if inst.a in table_fields:
                 table_fields[inst.a].append((constant_value(proto, inst.b), value))
                 refresh_table_expr(inst.a)
+            elif value in skip_assigned_values:
+                pass
             else:
                 emit(f"{field_expr(expr(inst.a), constant_value(proto, inst.b))} = {value}")
         elif op == "GETTABLE":
@@ -1469,13 +1493,18 @@ def source_lines_for_proto(proto: Proto, path: tuple[int, ...] = (), indent: str
                 skip_indices.add(following.index)
             elif inst.index == last_meaningful_index:
                 if inst.b <= 1:
-                    emit("return")
+                    if not (lines and lines[-1].strip().startswith("return ")):
+                        emit("return")
                 else:
                     returned = ", ".join(expr(reg) for reg in range(inst.a, inst.a + inst.b - 1))
                     emit(f"return {returned}")
             else:
                 returned = "" if inst.b <= 1 else " " + ", ".join(expr(reg) for reg in range(inst.a, inst.a + inst.b - 1))
-                emit(f"-- return{returned}")
+                if block_depth > 0:
+                    if returned or not (lines and lines[-1].strip().startswith("return ")):
+                        emit(f"return{returned}")
+                else:
+                    emit(f"-- return{returned}")
         elif op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW"}:
             symbol = {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/", "MOD": "%", "POW": "^"}[op]
             regs[inst.a] = f"({rk_expr(inst.b)} {symbol} {rk_expr(inst.c)})"
@@ -1532,12 +1561,125 @@ def readable_instruction_comment(proto: Proto, inst: Instruction) -> str:
     )
 
 
-def decompile_child_function(proto: Proto, path: tuple[int, ...]) -> list[str]:
-    name = proto_path_name(path)
+def recover_root_child_exports(proto: Proto) -> dict[int, str]:
+    regs: dict[int, str] = {}
+    closure_regs: dict[int, int] = {}
+    exports: dict[int, str] = {}
+    for inst in proto.instructions:
+        if inst.opname == "GETGLOBAL":
+            regs[inst.a] = constant_name(proto, inst.bx)
+            closure_regs.pop(inst.a, None)
+        elif inst.opname in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            base = regs.get(inst.b, register_name(inst.b))
+            regs[inst.a] = field_expr(base, constant_value(proto, inst.c))
+            closure_regs.pop(inst.a, None)
+        elif inst.opname == "NEWTABLE":
+            regs[inst.a] = "{}"
+            closure_regs.pop(inst.a, None)
+        elif inst.opname == "CLOSURE":
+            regs[inst.a] = proto_path_name((inst.bx,))
+            closure_regs[inst.a] = inst.bx
+        elif inst.opname in {"SETFIELD", "SETFIELD_R1"}:
+            child_index = closure_regs.get(inst.c)
+            if child_index is not None:
+                base = regs.get(inst.a, register_name(inst.a))
+                exports[child_index] = field_expr(base, constant_value(proto, inst.b))
+        elif inst.opname == "SETGLOBAL":
+            child_index = closure_regs.get(inst.a)
+            if child_index is not None:
+                exports[child_index] = constant_name(proto, inst.bx)
+    return exports
+
+
+def recover_root_child_upvalues(proto: Proto) -> dict[int, dict[int, str]]:
+    regs: dict[int, str] = {}
+    bindings: dict[int, dict[int, str]] = {}
+    instructions = proto.instructions
+    index = 0
+    while index < len(instructions):
+        inst = instructions[index]
+        if inst.opname == "GETGLOBAL":
+            regs[inst.a] = constant_name(proto, inst.bx)
+        elif inst.opname in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            regs[inst.a] = field_expr(regs.get(inst.b, register_name(inst.b)), constant_value(proto, inst.c))
+        elif inst.opname == "NEWTABLE":
+            regs[inst.a] = "{}"
+        elif inst.opname == "CLOSURE":
+            child_bindings: dict[int, str] = {}
+            lookahead = index + 1
+            upvalue_index = 0
+            while lookahead < len(instructions) and instructions[lookahead].opname == "DATA":
+                data_inst = instructions[lookahead]
+                if data_inst.a == 1:
+                    child_bindings[upvalue_index] = regs.get(data_inst.c, register_name(data_inst.c))
+                    upvalue_index += 1
+                lookahead += 1
+            if child_bindings:
+                bindings[inst.bx] = child_bindings
+            regs[inst.a] = proto_path_name((inst.bx,))
+        index += 1
+    return bindings
+
+
+def infer_event_upvalue_names(proto: Proto) -> dict[int, str]:
+    regs: dict[int, Any] = {}
+    methods: dict[int, tuple[str, Any]] = {}
+    names: dict[int, str] = {}
+
+    def value(reg: int) -> Any:
+        return regs.get(reg, register_name(reg))
+
+    for inst in proto.instructions:
+        op = inst.opname
+        if op == "GETGLOBAL":
+            regs[inst.a] = constant_name(proto, inst.bx)
+        elif op in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            regs[inst.a] = field_expr(str(value(inst.b)), constant_value(proto, inst.c))
+        elif op == "LOADK":
+            regs[inst.a] = constant_value(proto, inst.bx)
+        elif op == "MOVE":
+            regs[inst.a] = value(inst.b)
+        elif op == "GETUPVAL":
+            regs[inst.a] = ("upvalue", inst.b)
+        elif op == "SELF":
+            base = str(value(inst.b))
+            method = self_field_value(proto, inst.c)
+            regs[inst.a] = field_expr(base, method)
+            regs[inst.a + 1] = base
+            methods[inst.a] = (base, method)
+        elif op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+            if inst.a in methods:
+                _, method = methods.pop(inst.a)
+                args = [value(reg) for reg in range(inst.a + 2, inst.a + max(inst.b, 1))]
+                if method == "registerEventHandler" and len(args) >= 2 and isinstance(args[0], str):
+                    handler = args[1]
+                    if isinstance(handler, tuple) and handler[0] == "upvalue":
+                        names[int(handler[1])] = sanitize_local_name(args[0], f"upvalue_{handler[1]}")
+    return names
+
+
+def can_use_function_statement(name: str) -> bool:
+    return all(is_lua_identifier(part) for part in name.split("."))
+
+
+def decompile_child_function(
+    proto: Proto,
+    path: tuple[int, ...],
+    export_name: str | None = None,
+    local_name: str | None = None,
+    upvalue_names: dict[int, str] | None = None,
+) -> list[str]:
+    name = local_name or proto_path_name(path)
     params = ", ".join(source_params(proto, infer=True))
-    lines = [f"local function {name}({params})"]
+    if export_name:
+        if can_use_function_statement(export_name):
+            lines = [f"function {export_name}({params})"]
+        else:
+            lines = [f"{export_name} = function({params})"]
+    else:
+        lines = [f"local function {name}({params})"]
     if proto.instructions:
-        lines.extend(source_lines_for_proto(proto, path, "  ", infer_params=True))
+        lines.extend(source_lines_for_proto(proto, path, "  ", infer_params=True, upvalue_names=upvalue_names))
     lines.append("end")
     return lines
 
@@ -1580,14 +1722,42 @@ def readable_lua(proto: Proto, source_name: str = "") -> str:
         lines.append(f"-- Source payload: {source_name}")
     lines.append("")
 
+    root_exports = recover_root_child_exports(proto)
+    child_upvalues = recover_root_child_upvalues(proto)
+    local_child_names: dict[int, str] = {}
+    for child_index, upvalues in child_upvalues.items():
+        if 0 <= child_index < len(proto.children):
+            inferred_upvalue_names = infer_event_upvalue_names(proto.children[child_index])
+            for upvalue_index, name in inferred_upvalue_names.items():
+                bound_name = upvalues.get(upvalue_index)
+                if bound_name and bound_name.startswith("fn_"):
+                    try:
+                        bound_index = int(bound_name[3:])
+                    except ValueError:
+                        continue
+                    local_child_names.setdefault(bound_index, name)
+    skipped_root_values = {proto_path_name((child_index,)) for child_index in root_exports}
+    if proto.instructions:
+        lines.extend(source_lines_for_proto(proto, (), "", skip_assigned_values=skipped_root_values))
+        lines.append("")
+
     for path, child in iter_protos(proto):
         if not path:
             continue
-        lines.extend(decompile_child_function(child, path))
+        export_name = root_exports.get(path[0]) if len(path) == 1 else None
+        local_name = local_child_names.get(path[0]) if len(path) == 1 else None
+        raw_upvalue_names = child_upvalues.get(path[0], {}) if len(path) == 1 else {}
+        upvalue_names = {}
+        for upvalue_index, bound_name in raw_upvalue_names.items():
+            resolved_name = bound_name
+            if bound_name.startswith("fn_"):
+                try:
+                    resolved_name = local_child_names.get(int(bound_name[3:]), bound_name)
+                except ValueError:
+                    resolved_name = bound_name
+            upvalue_names[upvalue_index] = resolved_name
+        lines.extend(decompile_child_function(child, path, export_name, local_name, upvalue_names))
         lines.append("")
-
-    if proto.instructions:
-        lines.extend(source_lines_for_proto(proto, (), ""))
 
     lines.append("")
     return "\n".join(lines)
