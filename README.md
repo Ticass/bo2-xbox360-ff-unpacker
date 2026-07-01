@@ -2,8 +2,9 @@
 
 This is a Windows-friendly Xbox 360 Black Ops 2 `.ff` unpacker. The focus is
 safe extraction and metadata, especially compiled `.gsc`/`.csc` script payloads
-and compiled Treyarch/Xbox Lua UI payloads. The extracted payloads are still
-compiled/encrypted or bytecode game data; this tool does not decompile them yet.
+and compiled Treyarch/Xbox Lua UI payloads. The Lua tool can now produce
+Havok/T6 structural pseudo-decompilation, but extracted scripts remain compiled
+game bytecode until their respective source decompilers/compilers are complete.
 
 This repository contains source code only. Built `.exe` files, game fastfiles,
 and extracted outputs are intentionally not committed.
@@ -55,9 +56,10 @@ Use **Open Selected Output** in the app to jump straight to a completed folder.
     `script_inventory_summary.json`.
 - `lua_tool.py`
   - Parses BO2 Xbox/Treyarch Lua UI bytecode.
-  - Writes structured disassembly and pseudo-decompiled listings.
+  - Writes structured Havok/T6 disassembly and pseudo-decompiled listings,
+    including observed nested closure bodies.
   - Re-emits compiled Lua bytecode losslessly for recompile/repack testing.
-  - Editable Lua source decompilation/recompilation is not complete yet.
+  - Editable Lua source recompilation is not complete yet.
 - `ff_dashboard.py`
   - Starts a local browser dashboard for browsing scans, script payloads,
     hashes, fastfiles, and partial-scan warnings.
@@ -147,8 +149,8 @@ The payload starts with `1B 4C 75 61` (`\x1bLua`). These files are written to
 Lua bytecode, not readable Lua source yet.
 
 The app also writes pseudo-decompiled listings to `ui_lua_decompiled\`. These
-files expose constants and provisional opcode disassembly for reverse
-engineering. They are not yet valid editable source code.
+files expose constants, nested functions, and Havok/T6 opcode disassembly for
+reverse engineering. They are not yet valid editable source code.
 
 Confirmed examples:
 
@@ -210,5 +212,6 @@ python .\lua_tool.py recompile path\to\buttonlist.lua -o buttonlist.recompiled.l
 ```
 
 Lossless recompile currently means byte-for-byte re-emission of existing BO2 Lua
-bytecode. Compiling edited readable Lua source back into Treyarch bytecode still
-requires finishing the opcode/prototype mapping.
+bytecode after validating that the input is parseable. Compiling edited readable
+Lua source back into Treyarch/Havok bytecode still requires a real compiler or
+assembler for this Xbox format.

@@ -96,8 +96,12 @@ Example extracted paths:
 Lua bytecode tool status:
 
 - `lua_tool.py` parses the Treyarch Lua type table, root prototype metadata,
-  root instruction stream, constants, and enough debug/tail data to produce
-  structural pseudo-decompiled listings.
+  root instruction stream, constants, and observed nested closure bodies.
+- Xbox 360 stores Havok/T6 instruction words big-endian. The decoded fields
+  match the known T6 Havok opcode packing after reversing each 4-byte
+  instruction word for field extraction.
+- Root closure counts are inferred from `CLOSURE` operands, not from the first
+  post-constant footer value.
 - `lua_tool.py recompile` and `recompile-dir` currently perform lossless
   bytecode re-emission. This is useful for repack testing but is not editable
   source compilation yet.
@@ -110,8 +114,17 @@ Lua bytecode tool status:
   - 4-byte big-endian instructions
 - Nested prototypes appear to have an additional/custom preamble or hash/id
   field before their body. Example: `textfieldbutton.lua` child data begins
-  with `BD 80 50 A1`. Full nested prototype decoding and opcode semantics are
-  still required before true editable source decompilation/recompilation.
+  with `BD 80 50 A1`.
+- Observed nested closure body descriptor:
+  - 4-byte function id/hash, algorithm unknown.
+  - descriptor bytes preserved as raw hex in JSON.
+  - max-stack/register-like byte at descriptor offset `+0x14`.
+  - one-byte instruction count at descriptor offset `+0x18`.
+  - code starts at `align4(descriptor_start + 0x19)`.
+  - constants use the same observed big-endian string-length layout.
+- Full opcode semantics, high-level control flow recovery, local/upvalue naming,
+  and editable source recompilation are still required before true readable Lua
+  source round-tripping.
 
 ## Embedded GSC/CSC extraction
 

@@ -32,45 +32,103 @@ TYPE_NAMES = {
     4: "string",
 }
 
-LUA51_OPCODES = [
-    "MOVE",
-    "LOADK",
-    "LOADBOOL",
-    "LOADNIL",
-    "GETUPVAL",
+# HavokScript/Treyarch T6 opcode table. This table is cross-checked against
+# JariKCoding/CoDLuaDecompiler's HavokDefaultHavokLuaOpCodeTable; the Xbox 360
+# file wrapper differs, but instruction packing matches this T6 layout.
+HKS_OPCODES = [
+    "GETFIELD",
+    "TEST",
+    "CALL_I",
+    "CALL_C",
+    "EQ",
+    "EQ_BK",
     "GETGLOBAL",
-    "GETTABLE",
-    "SETGLOBAL",
-    "SETUPVAL",
-    "SETTABLE",
-    "NEWTABLE",
+    "MOVE",
     "SELF",
+    "RETURN",
+    "GETTABLE_S",
+    "GETTABLE_N",
+    "GETTABLE",
+    "LOADBOOL",
+    "TFORLOOP",
+    "SETFIELD",
+    "SETTABLE_S",
+    "SETTABLE_S_BK",
+    "SETTABLE_N",
+    "SETTABLE_N_BK",
+    "SETTABLE",
+    "SETTABLE_BK",
+    "TAILCALL_I",
+    "TAILCALL_C",
+    "TAILCALL_M",
+    "LOADK",
+    "LOADNIL",
+    "SETGLOBAL",
+    "JMP",
+    "CALL_M",
+    "CALL",
+    "INTRINSIC_INDEX",
+    "INTRINSIC_NEWINDEX",
+    "INTRINSIC_SELF",
+    "INTRINSIC_INDEX_LITERAL",
+    "INTRINSIC_NEWINDEX_LITERAL",
+    "INTRINSIC_SELF_LITERAL",
+    "TAILCALL",
+    "GETUPVAL",
+    "SETUPVAL",
     "ADD",
+    "ADD_BK",
     "SUB",
+    "SUB_BK",
     "MUL",
+    "MUL_BK",
     "DIV",
+    "DIV_BK",
     "MOD",
+    "MOD_BK",
     "POW",
+    "POW_BK",
+    "NEWTABLE",
     "UNM",
     "NOT",
     "LEN",
-    "CONCAT",
-    "JMP",
-    "EQ",
     "LT",
+    "LT_BK",
     "LE",
-    "TEST",
+    "LE_BK",
+    "CONCAT",
     "TESTSET",
-    "CALL",
-    "TAILCALL",
-    "RETURN",
-    "FORLOOP",
     "FORPREP",
-    "TFORLOOP",
+    "FORLOOP",
     "SETLIST",
     "CLOSE",
     "CLOSURE",
     "VARARG",
+    "TAILCALL_I_R1",
+    "CALL_I_R1",
+    "SETUPVAL_R1",
+    "TEST_R1",
+    "NOT_R1",
+    "GETFIELD_R1",
+    "SETFIELD_R1",
+    "NEWSTRUCT",
+    "DATA",
+    "SETSLOTN",
+    "SETSLOTI",
+    "SETSLOT",
+    "SETSLOTS",
+    "SETSLOTMT",
+    "CHECKTYPE",
+    "CHECKTYPES",
+    "GETSLOT",
+    "GETSLOTMT",
+    "SELFSLOT",
+    "SELFSLOTMT",
+    "GETFIELD_MM",
+    "CHECKTYPE_D",
+    "GETSLOT_D",
+    "GETGLOBAL_MEM",
+    "MAX",
 ]
 
 
@@ -92,12 +150,13 @@ class Constant:
 class Instruction:
     index: int
     offset: int
-    raw: int
+    raw: bytes
     opcode: int
     opname: str
     a: int
     b: int
     c: int
+    extra_c_bit: bool
     bx: int
     sbx: int
 
@@ -119,6 +178,10 @@ class Proto:
     constants: list[Constant] = field(default_factory=list)
     children: list["Proto"] = field(default_factory=list)
     debug: dict[str, Any] = field(default_factory=dict)
+
+
+def align4(offset: int) -> int:
+    return (offset + 3) & ~3
 
 
 def u32(data: bytes, offset: int) -> int:
@@ -153,17 +216,35 @@ def read_lua_string(data: bytes, offset: int) -> tuple[str | None, int]:
     return raw.decode("utf-8", "replace"), offset
 
 
-def parse_instruction(raw: int, index: int, offset: int) -> Instruction:
-    # Lua 5.1 instruction field layout. Opcode names are provisional for this
-    # Treyarch variant but useful for orientation while we verify differences.
-    opcode = raw & 0x3F
-    a = (raw >> 6) & 0xFF
-    c = (raw >> 14) & 0x1FF
-    b = (raw >> 23) & 0x1FF
-    bx = (raw >> 14) & 0x3FFFF
-    sbx = bx - 131071
-    opname = LUA51_OPCODES[opcode] if opcode < len(LUA51_OPCODES) else f"OP_{opcode:02d}"
-    return Instruction(index, offset, raw, opcode, opname, a, b, c, bx, sbx)
+def parse_instruction(raw: bytes, index: int, offset: int) -> Instruction:
+    if len(raw) != 4:
+        raise ParseError(f"instruction at 0x{offset:X} is not 4 bytes")
+
+    # Havok/T6 instruction packing. Xbox 360 stores each 32-bit instruction
+    # word big-endian; the known Havok/T6 decoder consumes the same word as
+    # little-endian bytes. Reverse the four bytes for field extraction while
+    # preserving raw file bytes for display and re-emission.
+    packed = raw[::-1]
+    # Field layout after byte-order normalization:
+    #   A      = byte 0
+    #   C      = byte 1 plus bit 0 of byte 2 as C's high bit
+    #   B      = byte 2 >> 1 plus bit 0 of byte 3 as B's high bit
+    #   opcode = byte 3 >> 1
+    # Bx/SBx follow the same derived B/C fields used by CoDLuaDecompiler.
+    a = packed[0]
+    c = packed[1]
+    b_value = packed[2]
+    flags_b = packed[3]
+    extra_c_bit = bool(b_value & 1)
+    b = b_value >> 1
+    if flags_b & 1:
+        b += 128
+    opcode = flags_b >> 1
+    c_full = c + (256 if extra_c_bit else 0)
+    bx = b * 512 + c_full
+    sbx = bx - 65536 + 1
+    opname = HKS_OPCODES[opcode] if opcode < len(HKS_OPCODES) else f"OP_{opcode:02d}"
+    return Instruction(index, offset, raw, opcode, opname, a, b, c_full, extra_c_bit, bx, sbx)
 
 
 def parse_constant(data: bytes, offset: int, index: int) -> tuple[Constant, int]:
@@ -232,7 +313,9 @@ def parse_proto(data: bytes, offset: int, index: int = 0) -> tuple[Proto, int]:
     instructions = []
     for i in range(instruction_count):
         inst_offset = offset
-        raw = u32(data, offset)
+        if offset + 4 > len(data):
+            raise ParseError(f"instruction {i} at 0x{offset:X} extends past EOF")
+        raw = data[offset : offset + 4]
         offset += 4
         instructions.append(parse_instruction(raw, i, inst_offset))
 
@@ -243,20 +326,28 @@ def parse_proto(data: bytes, offset: int, index: int = 0) -> tuple[Proto, int]:
         constant, offset = parse_constant(data, offset, i)
         constants.append(constant)
 
-    child_count = u32(data, offset)
+    footer_unknown = u32(data, offset)
     offset += 4
+
+    closure_indexes = [
+        inst.bx for inst in instructions if inst.opname == "CLOSURE" and inst.bx >= 0
+    ]
+    child_count = (max(closure_indexes) + 1) if closure_indexes else 0
     children = []
     child_parse_errors = []
     for i in range(child_count):
         child_offset = offset
         try:
-            child, offset = parse_proto(data, offset, i)
+            child, offset = parse_child_proto(data, offset, i)
             children.append(child)
         except ParseError as exc:
             child_parse_errors.append({"index": i, "offset": child_offset, "error": str(exc)})
             break
 
-    debug: dict[str, Any] = {}
+    debug: dict[str, Any] = {
+        "footer_unknown_be32": footer_unknown,
+        "child_count_inferred_from_closures": child_count,
+    }
     # Lua 5.1 debug tables are often present even when source text is stripped:
     # lineinfo[count], locals[count], upvalue names[count]. Keep parsing
     # conservative; if a table is malformed we leave the remaining tail raw.
@@ -329,6 +420,110 @@ def parse_proto(data: bytes, offset: int, index: int = 0) -> tuple[Proto, int]:
     )
 
 
+def parse_child_proto(data: bytes, offset: int, index: int = 0) -> tuple[Proto, int]:
+    """Parse an observed nested T6/Havok function body.
+
+    Nested functions in the Xbox fastfiles do not start with the same stripped
+    Lua source/line header used by the root function. The currently observed
+    form is:
+
+      u32  function id/hash (unknown algorithm)
+      0x10 bytes of descriptor data (unknown fields; preserved in JSON)
+      u8   register/max-stack count at descriptor + 0x14
+      3    unknown bytes
+      u8   instruction count at descriptor + 0x18
+      pad  to 4-byte boundary
+      code instructions
+      constants
+      u32  footer/unknown
+      child functions inferred from nested CLOSURE operands
+
+    The descriptor field names are intentionally cautious until we compare more
+    files or identify the exact HavokScript serializer.
+    """
+
+    start = offset
+    if offset + 0x19 > len(data):
+        raise ParseError(f"child function descriptor at 0x{offset:X} extends past EOF")
+
+    function_id = data[offset : offset + 4]
+    descriptor = data[offset : offset + 0x19]
+    max_stack = data[offset + 0x14]
+    instruction_count = data[offset + 0x18]
+    code_offset = align4(offset + 0x19)
+    if code_offset + instruction_count * 4 > len(data):
+        raise ParseError(
+            f"child function {index} at 0x{start:X} declares {instruction_count} instructions past EOF"
+        )
+
+    offset = code_offset
+    instructions = []
+    for i in range(instruction_count):
+        inst_offset = offset
+        raw = data[offset : offset + 4]
+        offset += 4
+        instructions.append(parse_instruction(raw, i, inst_offset))
+
+    constant_count = u32(data, offset)
+    offset += 4
+    constants = []
+    for i in range(constant_count):
+        constant, offset = parse_constant(data, offset, i)
+        constants.append(constant)
+
+    footer_unknown = u32(data, offset) if offset + 4 <= len(data) else None
+    if footer_unknown is not None:
+        offset += 4
+
+    closure_indexes = [
+        inst.bx for inst in instructions if inst.opname == "CLOSURE" and inst.bx >= 0
+    ]
+    child_count = (max(closure_indexes) + 1) if closure_indexes else 0
+    children = []
+    child_parse_errors = []
+    for i in range(child_count):
+        child_offset = offset
+        try:
+            child, offset = parse_child_proto(data, offset, i)
+            children.append(child)
+        except ParseError as exc:
+            child_parse_errors.append({"index": i, "offset": child_offset, "error": str(exc)})
+            break
+
+    debug: dict[str, Any] = {
+        "layout": "nested_havok_t6_observed",
+        "function_id_hex": function_id.hex(),
+        "descriptor_hex": descriptor.hex(),
+        "code_offset": code_offset,
+        "footer_unknown_be32": footer_unknown,
+        "child_count_inferred_from_closures": child_count,
+    }
+    if child_parse_errors:
+        debug["child_parse_errors"] = child_parse_errors
+        debug["children_parsed"] = len(children)
+
+    return (
+        Proto(
+            index=index,
+            offset=start,
+            end_offset=offset,
+            source=None,
+            line_defined=0,
+            last_line_defined=0,
+            upvalue_count=0,
+            param_count=0,
+            proto_flags=0,
+            instruction_count=instruction_count,
+            max_stack=max_stack,
+            instructions=instructions,
+            constants=constants,
+            children=children,
+            debug=debug,
+        ),
+        offset,
+    )
+
+
 def proto_to_dict(proto: Proto) -> dict[str, Any]:
     return {
         "index": proto.index,
@@ -350,6 +545,22 @@ def proto_to_dict(proto: Proto) -> dict[str, Any]:
                 "offset": c.offset,
             }
             for c in proto.constants
+        ],
+        "instructions": [
+            {
+                "index": inst.index,
+                "offset": inst.offset,
+                "raw_hex": inst.raw.hex(),
+                "opcode": inst.opcode,
+                "opname": inst.opname,
+                "a": inst.a,
+                "b": inst.b,
+                "c": inst.c,
+                "extra_c_bit": inst.extra_c_bit,
+                "bx": inst.bx,
+                "sbx": inst.sbx,
+            }
+            for inst in proto.instructions
         ],
         "children": [proto_to_dict(child) for child in proto.children],
         "debug": proto.debug,
@@ -398,8 +609,9 @@ def disassemble_proto(proto: Proto, indent: str = "") -> list[str]:
     lines.append(f"{indent}.code {len(proto.instructions)}")
     for inst in proto.instructions:
         lines.append(
-            f"{indent}  [{inst.index:04d}] 0x{inst.offset:06X} {inst.raw:08X} "
-            f"{inst.opname:<10} A={inst.a:03d} B={inst.b:03d} C={inst.c:03d} Bx={inst.bx:06d} sBx={inst.sbx:+d}"
+            f"{indent}  [{inst.index:04d}] 0x{inst.offset:06X} {inst.raw.hex(' ').upper():<11} "
+            f"{inst.opname:<26} A={inst.a:03d} B={inst.b:03d} C={inst.c:03d} "
+            f"Bx={inst.bx:06d} sBx={inst.sbx:+d}"
         )
     for child in proto.children:
         lines.extend(disassemble_proto(child, indent + "  "))
@@ -410,7 +622,7 @@ def pseudo_decompile(proto: Proto) -> str:
     lines = [
         "-- BO2 Xbox/Treyarch compiled Lua bytecode",
         "-- This is a structural pseudo-decompile, not verified source.",
-        "-- Constants and provisional Lua 5.1 opcode names are shown for reverse engineering.",
+        "-- Constants and Havok/T6 opcode names are shown for reverse engineering.",
         "",
     ]
     string_constants = [c for c in proto.constants if c.type_name == "string"]
