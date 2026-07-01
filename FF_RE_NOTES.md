@@ -104,6 +104,61 @@ Example extracted paths:
 
 Lua bytecode tool status:
 
+- Nested-proto descriptor fields are now decoded: big-endian `uint32` at
+  descriptor `+0x08` is the upvalue count and `+0x0C` is the parameter count
+  (verified against every child of `textfieldbutton.lua`). This gives real
+  function signatures instead of empty/`arg0..argN` parameter lists.
+- Nested instruction count is a big-endian `uint16` at descriptor `+0x17` (the
+  earlier single-byte read at `+0x18` truncated any function with >=256
+  instructions and then misparsed code as constants). Fixing this recovered
+  ALL nested function bodies: child-proto parse failures across
+  `patch_ui_mp` + `patch_ui_zm` dropped from 124 files to 0, and lossless
+  bytecode round-trip stays byte-identical (verified incl. `cacclassloadout`,
+  whose `new` has 342 instructions).
+- Current readable-source quality across the 186-file MP/ZM UI corpus: zero
+  `arg0`/`var0`/`slot0`/`local_N`/`fn_N` placeholders, zero unresolved opcodes,
+  zero decompile failures, and every file is valid balanced Lua (no open/`end`
+  mismatch). 176/186 files are fully structured; 10 still emit a few
+  `-- control flow` comments for advanced shapes.
+- Control-flow recovery now also handles `and`/`or` short-circuits (`TESTSET`,
+  including call operands), boolean-valued comparisons
+  (`cmp; JMP; LOADBOOL A 0 1; LOADBOOL A 1 0` -> `x = a op b`), and no-op
+  `JMP sBx=0`. Total `-- control flow` comments across the corpus fell from
+  ~651 to ~18 lines.
+- Generic `for ... in` loops are now located from the TFORLOOP back edge (the
+  loop-entry JMP is at back-target - 1), fixing nested loops where an inner
+  forward JMP also targets the TFORLOOP (previously produced an empty
+  `for ... do end` with the body escaping, e.g. serverlist/cacweaponslot).
+- Reassignments from `MOVE` into already-declared locals are now emitted, which
+  restores iterator updates such as `child = sibling` in `while child do` loops.
+- Remaining decompiler tail: `elseif` chains, `break`, and `repeat/until`
+  back-edges/boolean-normalization jumps in 10 files (18 total `-- control flow`
+  comments); anonymous inline closures hoisted as `callbackN` instead of inline
+  `function()...end`; a few unrecoverable parent-local captures shown as
+  `upvalueN`.
+- `decompile-source` now recovers meaningful parameter names with no generic
+  `arg0`/`var0`/`slot0`/`local_N` placeholders in the MP/ZM UI corpus: `self`
+  for member methods, `(element, event)` for handlers, setter-derived names
+  (`obj:setActionEventName(p)` -> `eventName`), table-field-key names, and
+  `string`/`Localize` argument names (`text`).
+- Control-flow recovery now emits structured `if`, `if/else`, `while`, numeric
+  `for`, and generic `for ... in` blocks. Current MP/ZM verification still has
+  18 `-- control flow` comments across 10 files.
+- Root child functions get one consistent name used at both the declaration and
+  every upvalue reference. Open-upvalue captures to parent register slots are
+  resolved via a whole-root closure pre-scan, so forward-referenced module-level
+  local functions bind correctly. Anonymous factory helpers are named from their
+  returned constructor (`return X.new(...)` -> `createX`).
+- The unpacker also carves `.menu` payloads verbatim (`extract_embedded_menu_blobs`)
+  into `menus/` alongside `scripts/` and `ui_lua/`. Most BO2 UI is LUI (`.lua`);
+  classic `menuDef_t` assets not stored as contiguous pointer blobs still need
+  the zone asset-stream parser.
+- Known remaining decompiler gaps: some anonymous nested closures still use
+  consistent but generic `callbackN`/`localFunctionN` names; a few genuinely
+  unrecoverable parent-local captures show as `upvalueN`; advanced jump shapes
+  still need `elseif`/`break`/boolean-normalization recovery; and there is still
+  no readable-source -> bytecode compiler (recompilation is currently
+  lossless-bytecode / offset-patch only).
 - `lua_tool.py` parses the Treyarch Lua type table, root prototype metadata,
   root instruction stream, constants, and observed nested closure bodies.
 - `lua_tool.py decompile-source` / `decompile-source-dir` write readable Lua

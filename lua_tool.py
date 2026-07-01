@@ -24,6 +24,7 @@ import gzip
 import hashlib
 import json
 import math
+import re
 import shlex
 import struct
 from dataclasses import dataclass, field
@@ -608,8 +609,25 @@ def parse_child_proto(data: bytes, offset: int, index: int = 0) -> tuple[Proto, 
 
     function_id = data[offset : offset + 4]
     descriptor = data[offset : offset + 0x19]
+    # Observed nested descriptor fields (big-endian u32):
+    #   +0x08 = upvalue count, +0x0C = parameter count.
+    # Verified against every child in textfieldbutton.lua (self/text=2,
+    # ConvertToStar=1, event handlers=2, new=3 params / 2 upvalues). Values
+    # outside a sane range fall back to 0 so unknown descriptor variants stay
+    # lossless rather than emitting bogus signatures.
+    upvalue_count = u32(data, offset + 0x08)
+    param_count = u32(data, offset + 0x0C)
+    if upvalue_count > 250:
+        upvalue_count = 0
+    if param_count > 250:
+        param_count = 0
     max_stack = data[offset + 0x14]
-    instruction_count = data[offset + 0x18]
+    # Instruction count is a big-endian uint16 at descriptor +0x17. Earlier code
+    # read only the low byte at +0x18, which truncated any function with >=256
+    # instructions (e.g. cacclassloadout.new has 342) and then misparsed the
+    # remaining code as constants ("unsupported constant tag ..."). Verified
+    # against textfieldbutton (7/27/231, high byte 0) and cacclassloadout (342).
+    instruction_count = u16(data, offset + 0x17)
     code_offset = align4(offset + 0x19)
     if code_offset + instruction_count * 4 > len(data):
         raise ParseError(
@@ -670,8 +688,8 @@ def parse_child_proto(data: bytes, offset: int, index: int = 0) -> tuple[Proto, 
             source=None,
             line_defined=0,
             last_line_defined=0,
-            upvalue_count=0,
-            param_count=0,
+            upvalue_count=upvalue_count,
+            param_count=param_count,
             proto_flags=0,
             instruction_count=instruction_count,
             max_stack=max_stack,
@@ -1194,6 +1212,10 @@ def register_name(index: int) -> str:
     return f"local_{index}"
 
 
+def fallback_local_name(index: int) -> str:
+    return "value"
+
+
 def read_registers(inst: Instruction) -> list[int]:
     op = inst.opname
     if op in {"MOVE", "UNM", "NOT", "NOT_R1", "LEN"}:
@@ -1295,13 +1317,191 @@ def infer_input_registers(proto: Proto) -> list[int]:
     return list(range(highest + 1))
 
 
-def source_params(proto: Proto, infer: bool = False) -> list[str]:
+def _lower_first(value: str) -> str:
+    return value[:1].lower() + value[1:] if value else value
+
+
+def _setter_param_name(method: str, arg_pos: int) -> str | None:
+    """Infer a parameter name from a `setX(param)` style method call."""
+    overrides = {
+        "setActionEventName": ["eventName"],
+        "setText": ["text"],
+        "setTitle": ["title"],
+        "setSubtitle": ["text"],
+        "setModel": ["model"],
+        "setShader": ["shaderName"],
+        "setImage": ["image"],
+        "setIcon": ["icon"],
+        "setState": ["state"],
+        "setActionEvent": ["eventName"],
+        "addElement": ["element"],
+        "registerEventHandler": ["eventName", "callback"],
+    }
+    if method in overrides and arg_pos < len(overrides[method]):
+        return overrides[method][arg_pos]
+    if arg_pos == 0 and method.startswith("set") and len(method) > 3:
+        candidate = _lower_first(method[3:])
+        return candidate if is_lua_identifier(candidate) else None
+    return None
+
+
+def infer_param_names(
+    proto: Proto,
+    func_name: str | None = None,
+    is_local: bool = False,
+) -> list[str] | None:
+    """Recover meaningful parameter names from bytecode usage.
+
+    No debug symbol table survives in these payloads, so names are inferred
+    from how each parameter register is consumed:
+      * a member function whose first register is used as a table receiver
+        gets `self`; a receiver in a local/handler function gets `element`;
+      * the second parameter of a two-arg receiver function is the `event`
+        table (BO2 LUI event-handler convention);
+      * a register passed to `obj:setX(param)` is named after the setter;
+      * a register stored into a table field is named after that field.
+    Anything still unresolved falls back to a descriptive `value` name so no
+    generic `arg0`/`var0` placeholders ever reach the output.
+    """
+    count = proto.param_count
+    if count <= 0:
+        return None
+
+    insts = [inst for inst in proto.instructions if inst.opname != "DATA"]
+
+    def is_receiver(reg: int) -> bool:
+        for inst in insts:
+            if (
+                inst.opname
+                in {
+                    "SELF",
+                    "GETFIELD",
+                    "GETFIELD_R1",
+                    "GETFIELD_MM",
+                    "GETTABLE",
+                    "GETTABLE_S",
+                    "GETTABLE_N",
+                }
+                and inst.b == reg
+            ):
+                return True
+            if (
+                inst.opname
+                in {"SETFIELD", "SETFIELD_R1", "SETTABLE", "SETTABLE_S", "SETTABLE_S_BK", "SETTABLE_N"}
+                and inst.a == reg
+            ):
+                return True
+        return False
+
+    names: list[str | None] = [None] * count
+
+    dotted_member = bool(func_name and "." in func_name and ":" not in func_name)
+    if is_receiver(0):
+        names[0] = "self" if (dotted_member and not is_local) else "element"
+        if count == 2 and names[0] == "element":
+            names[1] = "event"
+
+    # Setter-argument names: track the method selected by the most recent SELF
+    # into a register, then read it off the following CALL. Parameters are often
+    # MOVEd into a scratch register before the call, so follow those copies.
+    self_method: dict[int, str | None] = {}
+    alias: dict[int, int] = {}
+    for inst in insts:
+        if inst.opname == "MOVE" and inst.b < count:
+            alias[inst.a] = inst.b
+        elif inst.opname == "SELF":
+            const_index = rk_constant_index(inst.c)
+            method = constant_value(proto, const_index) if const_index is not None else None
+            self_method[inst.a] = method if isinstance(method, str) else None
+        elif inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+            method = self_method.get(inst.a)
+            if method:
+                for arg_pos, reg in enumerate(range(inst.a + 2, inst.a + max(inst.b, 1))):
+                    param = reg if reg < count else alias.get(reg)
+                    if param is not None and param < count and names[param] is None:
+                        candidate = _setter_param_name(method, arg_pos)
+                        if candidate:
+                            names[param] = candidate
+            self_method.pop(inst.a, None)
+        else:
+            target = written_register(inst)
+            if target is not None:
+                self_method.pop(target, None)
+                alias.pop(target, None)
+
+    # Plain-call argument names: resolve the callee of `f(...)` style calls
+    # (GETGLOBAL/GETFIELD chains) and name well-known arguments.
+    reg_expr: dict[int, str] = {}
+    alias2: dict[int, int] = {}
+    for inst in insts:
+        if inst.opname == "GETGLOBAL":
+            reg_expr[inst.a] = constant_name(proto, inst.bx)
+        elif inst.opname in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            base = reg_expr.get(inst.b)
+            field = constant_value(proto, inst.c)
+            reg_expr[inst.a] = f"{base}.{field}" if base and isinstance(field, str) else ""
+        elif inst.opname == "MOVE" and inst.b < count:
+            alias2[inst.a] = inst.b
+        elif inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+            callee = reg_expr.get(inst.a) or ""
+            last = callee.rsplit(".", 1)[-1] if callee else ""
+            for arg_pos, reg in enumerate(range(inst.a + 1, inst.a + max(inst.b, 1))):
+                param = reg if reg < count else alias2.get(reg)
+                if param is None or param >= count or names[param] is not None:
+                    continue
+                if last in {"len", "Localize", "ToUpper", "lower", "upper"} and arg_pos == 0:
+                    names[param] = "text"
+                elif last.endswith("SetText") and arg_pos == 1:
+                    names[param] = "text"
+            reg_expr.pop(inst.a, None)
+        else:
+            target = written_register(inst)
+            if target is not None:
+                reg_expr.pop(target, None)
+                alias2.pop(target, None)
+
+    # Table-field names: a parameter stored as `t.field = param`.
+    for inst in insts:
+        if inst.opname in {"SETFIELD", "SETFIELD_R1"} and inst.c < count and names[inst.c] is None:
+            field = constant_value(proto, inst.b)
+            if isinstance(field, str) and is_lua_identifier(field):
+                names[inst.c] = _lower_first(field)
+
+    used: set[str] = set()
+    result: list[str] = []
+    for index, name in enumerate(names):
+        base = name or "value"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}{suffix}"
+            suffix += 1
+        used.add(candidate)
+        result.append(candidate)
+    return result
+
+
+def source_params(
+    proto: Proto,
+    infer: bool = False,
+    func_name: str | None = None,
+    is_local: bool = False,
+) -> list[str]:
+    inferred = infer_param_names(proto, func_name=func_name, is_local=is_local)
+    if inferred is not None and len(inferred) >= proto.param_count > 0:
+        # Extend with inferred extra input registers if the caller wants them.
+        if infer:
+            extra = len(infer_input_registers(proto)) - len(inferred)
+            for offset in range(max(extra, 0)):
+                inferred.append(f"value{len(inferred) + offset}")
+        return inferred
     count = proto.param_count
     if infer:
         count = max(count, len(infer_input_registers(proto)))
     if count <= 0:
         return ["..."]
-    return [f"arg{index}" for index in range(count)]
+    # Last-resort naming still avoids raw arg/var placeholders.
+    return [("self" if index == 0 else f"value{index}") for index in range(count)]
 
 
 def strip_trailing_control_comments(lines: list[str]) -> list[str]:
@@ -1317,6 +1517,144 @@ def sanitize_local_name(value: str, fallback: str) -> str:
     return cleaned if is_lua_identifier(cleaned) else fallback
 
 
+def camel_from_parts(parts: list[str], fallback: str) -> str:
+    cleaned = [sanitize_local_name(part, "") for part in parts if part]
+    cleaned = [part for part in cleaned if part]
+    if not cleaned:
+        return fallback
+    name = cleaned[0][0].lower() + cleaned[0][1:]
+    for part in cleaned[1:]:
+        name += part[:1].upper() + part[1:]
+    return name if is_lua_identifier(name) else fallback
+
+
+def semantic_name_from_expr(value: str, fallback: str) -> str:
+    call = value.split("(", 1)[0].strip()
+    bare_calls = {
+        "GetTextDimensions": "textDimensions",
+        "RegisterMaterial": "material",
+        "tonumber": "number",
+        "tostring": "text",
+    }
+    if call in bare_calls:
+        return bare_calls[call]
+    if call.endswith(".new") or call.endswith(":new"):
+        owner = call.rsplit(".", 1)[0].rsplit(":", 1)[0].split(".")[-1]
+        known = {
+            "UIButton": "button",
+            "UIText": "text",
+            "UIImage": "image",
+            "UIElement": "element",
+            "UIVerticalList": "verticalList",
+            "Border": "border",
+            "ButtonList": "buttonList",
+            "CoD9Button": "button",
+            "GrowingGridButton": "button",
+            "NavButton": "button",
+            "VerticalList": "verticalList",
+        }
+        return known.get(owner, camel_from_parts([owner], fallback))
+    if ":" in call:
+        method = call.rsplit(":", 1)[1]
+        method_names = {
+            "addButton": "button",
+            "addCardCarousel": "cardCarousel",
+            "addNewCard": "card",
+            "getParent": "parent",
+            "getFirstChild": "child",
+            "getNextSibling": "sibling",
+            "isInFocus": "isInFocus",
+            "isPanelOnscreen": "isPanelOnscreen",
+            "openMenu": "menu",
+            "openPopup": "popup",
+            "restoreState": "restoredState",
+        }
+        if method in method_names:
+            return method_names[method]
+        if method == "get":
+            return "dvarValue"
+        if method.startswith("get") and len(method) > 3:
+            return camel_from_parts([method[3:]], fallback)
+        if method.startswith("is") and len(method) > 2:
+            return "is" + method[2:3].upper() + method[3:]
+    if call.startswith("fn_"):
+        return "result"
+    if "." in call:
+        owner, method = call.rsplit(".", 1)
+        known_calls = {
+            "AcceptingInvite": "isAcceptingInvite",
+            "AloneInPartyIgnoreSplitscreen": "isAloneInParty",
+            "AreAnyAttachmentsNew": "hasNewAttachments",
+            "CheckLeagueDivisionChange": "leaguePromotionStatus",
+            "DvarString": "dvarValue",
+            "FormatNumberWithCommas": "formattedNumber",
+            "GetCustomClass": "customClass",
+            "GetAttachmentRef": "attachmentRef",
+            "GetItemAttachment": "itemAttachment",
+            "GetItemName": "itemName",
+            "GetPlaylistID": "playlistId",
+            "GetLeagueSeasonDate": "seasonDate",
+            "GetXUID": "xuid",
+            "HasDLCContent": "hasDLCContent",
+            "HasMPPrivileges": "hasMPPrivileges",
+            "PartyShowTruePlayerInfoByXuid": "showTruePlayerInfo",
+            "PartyHostIsReadyToStart": "isPartyHostReady",
+            "PartyIsReadyToStart": "isPartyReady",
+            "PrivatePartyHost": "isPrivatePartyHost",
+            "ProfileValueAsString": "profileValue",
+            "ProfileInt": "profileValue",
+            "SessionMode_IsSystemlinkGame": "isSystemlinkGame",
+            "SessionModeIsMode": "isSessionMode",
+            "GameModeIsMode": "isGameMode",
+            "TableLookup": "tableValue",
+            "DvarInt": "dvarValue",
+            "Localize": "localizedText",
+            "ToUpper": "upperText",
+            "WebM_camera_IsAvailable": "isCameraAvailable",
+        }
+        if method in known_calls:
+            return known_calls[method]
+        if method == "New" and owner.endswith(".Menu"):
+            return "menu"
+        if method in {"NewSmallPopup", "SetupPopup", "SetupPopupBusy", "SetupPopupChoice"}:
+            return "popup"
+        if owner == "string" and method == "len":
+            return "length"
+        if owner == "string" and method in {"find", "match"}:
+            return "match"
+        if owner == "string" and method == "lower":
+            return "lowerText"
+        if owner == "math" and method in {"min", "max", "floor", "ceil"}:
+            return "value"
+        if owner == "math" and method == "sqrt":
+            return "distance"
+        if method == "NewRegistrationButton":
+            return "button"
+        if method.startswith("New") and method.endswith("Button"):
+            return "button"
+        if method == "New" and owner.startswith("CoD."):
+            return camel_from_parts([owner.rsplit(".", 1)[-1]], fallback)
+        if method.startswith("Is") and len(method) > 2:
+            return "is" + method[2:]
+        if method.startswith("Has") and len(method) > 3:
+            return "has" + method[3:]
+        if method.startswith("Should") and len(method) > 6:
+            return "should" + method[6:]
+        if method.startswith("Does") and len(method) > 4:
+            return "does" + method[4:]
+        if method.startswith("Can") and len(method) > 3:
+            return "can" + method[3:]
+        if method.startswith("Are") and len(method) > 3:
+            return "are" + method[3:]
+        if method.startswith("Get") and len(method) > 3:
+            return camel_from_parts([method[3:]], fallback)
+        if method.startswith("Create") and len(method) > 6:
+            return camel_from_parts([method[6:]], fallback)
+    if value.startswith("{"):
+        return "data"
+    return fallback
+
+
 def source_lines_for_proto(
     proto: Proto,
     path: tuple[int, ...] = (),
@@ -1324,13 +1662,19 @@ def source_lines_for_proto(
     infer_params: bool = False,
     skip_assigned_values: set[str] | None = None,
     upvalue_names: dict[int, str] | None = None,
+    func_name: str | None = None,
+    is_local: bool = False,
+    names_by_path: dict[tuple[int, ...], str] | None = None,
 ) -> list[str]:
+    names_by_path = names_by_path or {}
     regs: dict[int, str] = {}
     methods: dict[int, tuple[str, Any]] = {}
     table_fields: dict[int, list[tuple[Any, str]]] = {}
     declared: set[int] = set()
+    local_names: dict[int, str] = {}
+    used_local_names: set[str] = set()
     lines: list[str] = []
-    params = source_params(proto, infer=infer_params)
+    params = source_params(proto, infer=infer_params, func_name=func_name, is_local=is_local)
     param_registers = {index for index, name in enumerate(params) if name != "..."}
     skip_assigned_values = skip_assigned_values or set()
     upvalue_names = upvalue_names or {}
@@ -1338,8 +1682,33 @@ def source_lines_for_proto(
         if name != "...":
             regs[index] = name
 
+    def unique_local_name(base: str, reg: int) -> str:
+        fallback = register_name(reg)
+        base = sanitize_local_name(base, fallback)
+        if base in {"arg0", "arg1", "arg2", "arg3", "arg4", "arg5"}:
+            base = fallback
+        candidate = base
+        suffix = 2
+        while candidate in used_local_names or candidate in params:
+            candidate = f"{base}{suffix}"
+            suffix += 1
+        used_local_names.add(candidate)
+        return candidate
+
+    def local_reg_name(reg: int, hint: str | None = None) -> str:
+        fallback = register_name(reg)
+        if reg not in local_names:
+            local_names[reg] = unique_local_name(hint or fallback_local_name(reg), reg)
+        elif reg not in declared and hint:
+            current = local_names[reg]
+            wanted = sanitize_local_name(hint, fallback)
+            if current in {fallback, fallback_local_name(reg)} and wanted != fallback:
+                used_local_names.discard(current)
+                local_names[reg] = unique_local_name(wanted, reg)
+        return local_names[reg]
+
     def expr(reg: int) -> str:
-        return regs.get(reg, register_name(reg))
+        return regs.get(reg, local_reg_name(reg))
 
     def rk_expr(index: int) -> str:
         const_index = rk_constant_index(index)
@@ -1380,14 +1749,40 @@ def source_lines_for_proto(
     def emit(text: str) -> None:
         lines.append(f"{indent}{'  ' * block_depth}{text}")
 
-    def assign(reg: int, value: str, force_local: bool = False) -> None:
-        if force_local or reg not in declared:
-            emit(f"local {register_name(reg)} = {value}")
+    def assign(reg: int, value: str, force_local: bool = False, hint: str | None = None) -> None:
+        semantic_hint = hint or semantic_name_from_expr(value, register_name(reg))
+        if semantic_hint == register_name(reg):
+            semantic_hint = fallback_local_name(reg)
+        name = local_reg_name(reg, semantic_hint)
+        redeclare = False
+        if reg not in declared and semantic_hint and semantic_hint != name:
+            used_local_names.discard(name)
+            name = unique_local_name(semantic_hint, reg)
+            local_names[reg] = name
+        if reg in declared and semantic_hint and semantic_hint != name:
+            current_is_boolean = name.startswith("is") and len(name) > 2 and name[2].isupper()
+            hint_is_boolean = semantic_hint.startswith("is") and len(semantic_hint) > 2 and semantic_hint[2].isupper()
+            object_hint = semantic_hint in {
+                "button",
+                "buttonList",
+                "element",
+                "text",
+                "image",
+                "border",
+                "verticalList",
+                "slotListGridButton",
+            }
+            redeclare = current_is_boolean != hint_is_boolean or object_hint or name.startswith("local_")
+            if redeclare:
+                name = unique_local_name(semantic_hint, reg)
+                local_names[reg] = name
+        if force_local or reg not in declared or redeclare:
+            emit(f"local {name} = {value}")
             if block_depth == 0:
                 declared.add(reg)
         else:
-            emit(f"{register_name(reg)} = {value}")
-        regs[reg] = register_name(reg)
+            emit(f"{name} = {value}")
+        regs[reg] = name
 
     def emit_param_update(reg: int) -> None:
         if block_depth > 0 and reg in param_registers:
@@ -1404,13 +1799,31 @@ def source_lines_for_proto(
     for pos, inst in enumerate(meaningful):
         next_meaningful[inst.index] = meaningful[pos + 1] if pos + 1 < len(meaningful) else None
     skip_indices: set[int] = set()
-    structured_ifs: dict[int, tuple[Instruction, int]] = {}
+    structured_ifs: dict[int, tuple[Instruction, int, str]] = {}
     close_after: dict[int, int] = {}
+    else_after: dict[int, int] = {}
     by_index = {inst.index: inst for inst in meaningful}
     meaningful_positions = {inst.index: pos for pos, inst in enumerate(meaningful)}
     generic_loop_starts: dict[int, Instruction] = {}
     generic_loop_ends: dict[int, Instruction] = {}
     generic_iterator_calls: set[int] = set()
+    # Boolean-valued comparisons: cmp -> R_A = (a op b). Keyed by cmp index.
+    bool_value: dict[int, int] = {}
+    # Short-circuit and/or: TESTSET index -> (dst, operand_expr, "and"/"or", target).
+    andor_start: dict[int, tuple[int, str, str, int]] = {}
+    andor_finalize: dict[int, list[tuple[int, str, str]]] = {}
+
+    _COMPARE_OPS = {"EQ", "EQ_BK", "LT", "LT_BK", "LE", "LE_BK", "TEST", "TEST_R1"}
+
+    def compare_value_text(inst: Instruction) -> str:
+        """The value produced by a comparison used as `x = a op b`."""
+        if inst.opname in {"TEST", "TEST_R1"}:
+            value = expr(inst.a if inst.opname == "TEST" else inst.b)
+            return value if inst.c else f"not {value}"
+        true_ops = {"EQ": "==", "EQ_BK": "==", "LT": "<", "LT_BK": "<", "LE": "<=", "LE_BK": "<="}
+        false_ops = {"EQ": "~=", "EQ_BK": "~=", "LT": ">=", "LT_BK": ">=", "LE": ">", "LE_BK": ">"}
+        op = true_ops[inst.opname] if inst.a else false_ops[inst.opname]
+        return f"{rk_expr(inst.b)} {op} {rk_expr(inst.c)}"
 
     def condition_text(inst: Instruction) -> str:
         if inst.opname in {"TEST", "TEST_R1"}:
@@ -1424,53 +1837,202 @@ def source_lines_for_proto(
             condition = f"not ({condition})"
         return condition
 
+    def last_inner_before(boundary: int) -> Instruction | None:
+        """Last meaningful instruction with index < boundary."""
+        result: Instruction | None = None
+        for candidate in meaningful:
+            if candidate.index < boundary:
+                result = candidate
+            else:
+                break
+        return result
+
+    # Pass 1: generic `for ... in` loops. Layout:
+    #     JMP L2 ; L1: <body> ; L2: TFORLOOP ; JMP L1 (backward)
+    # Identify the loop from the TFORLOOP + its backward JMP, then find the entry
+    # JMP at (L1 - 1). Other forward JMPs inside the body can also target the
+    # TFORLOOP (continue-style), so the entry must be located via the back edge,
+    # not by picking any JMP that lands on the TFORLOOP.
     for inst in meaningful:
-        following = next_meaningful.get(inst.index)
-        if inst.opname in {"EQ", "EQ_BK", "LT", "LT_BK", "LE", "LE_BK", "TEST", "TEST_R1"} and following and following.opname == "JMP" and following.sbx > 0:
-            end_index = following.index + following.sbx
-            structured_ifs[inst.index] = (following, end_index)
-            close_after[end_index] = close_after.get(end_index, 0) + 1
-        if inst.opname == "JMP" and inst.sbx > 0:
-            target = by_index.get(inst.index + inst.sbx + 1)
-            if target and target.opname == "TFORLOOP":
-                after_target = next_meaningful.get(target.index)
-                if after_target and after_target.opname == "JMP" and after_target.sbx < 0:
-                    generic_loop_starts[inst.index] = target
-                    generic_loop_ends[target.index] = after_target
-                    previous_pos = meaningful_positions.get(inst.index, 0) - 1
+        if inst.opname == "TFORLOOP":
+            back = next_meaningful.get(inst.index)
+            if back and back.opname == "JMP" and back.sbx < 0:
+                body_start = back.index + back.sbx + 1
+                start = by_index.get(body_start - 1)
+                if (
+                    start is not None
+                    and start.opname == "JMP"
+                    and start.sbx > 0
+                    and start.index + start.sbx + 1 == inst.index
+                ):
+                    generic_loop_starts[start.index] = inst
+                    generic_loop_ends[inst.index] = back
+                    previous_pos = meaningful_positions.get(start.index, 0) - 1
                     if previous_pos >= 0:
                         previous = meaningful[previous_pos]
-                        if previous.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"} and previous.a == target.a:
+                        if previous.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"} and previous.a == inst.a:
                             generic_iterator_calls.add(previous.index)
 
+    # Pass 1b: boolean-valued comparisons `R_A = a op b`, encoded as
+    #   <cmp> ; JMP +1 ; LOADBOOL A 0 1 ; LOADBOOL A 1 0
+    # and short-circuit `and`/`or`, encoded as
+    #   TESTSET A B C ; JMP +n ; <n instrs computing R_A>
+    # These consume a comparison/test that would otherwise look like an `if`.
+    for pos, inst in enumerate(meaningful):
+        if inst.opname in _COMPARE_OPS and pos + 3 < len(meaningful):
+            jmp, lb1, lb2 = meaningful[pos + 1], meaningful[pos + 2], meaningful[pos + 3]
+            if (
+                jmp.opname == "JMP"
+                and lb1.opname == "LOADBOOL"
+                and lb2.opname == "LOADBOOL"
+                and lb1.a == lb2.a
+                and lb1.b == 0
+                and lb1.c == 1
+                and lb2.b == 1
+                and lb2.c == 0
+            ):
+                bool_value[inst.index] = lb1.a
+                skip_indices.update({jmp.index, lb1.index, lb2.index})
+                continue
+        if inst.opname == "TESTSET" and pos + 1 < len(meaningful):
+            jmp = meaningful[pos + 1]
+            if jmp.opname == "JMP" and jmp.sbx > 0:
+                target = jmp.index + jmp.sbx + 1
+                operand = [m for m in meaningful if inst.index < m.index < target and m.index != jmp.index]
+                # The operand block must compute a single value into R_A. Allow
+                # calls/field access, but reject structural ops that would break
+                # the single-expression assumption.
+                safe = operand and all(
+                    m.opname
+                    not in {
+                        "SETGLOBAL", "SETUPVAL", "SETUPVAL_R1", "RETURN", "JMP",
+                        "CLOSURE", "TESTSET", "FORPREP", "FORLOOP", "TFORLOOP",
+                    }
+                    for m in operand
+                )
+                if safe:
+                    op = "or" if inst.c else "and"
+                    andor_start[inst.index] = (inst.a, "", op, target)
+                    andor_finalize.setdefault(target, [])
+                    skip_indices.add(jmp.index)
+
+        # A JMP that lands on the very next instruction (sBx == 0) is a no-op;
+        # if a bare comparison feeds only that jump, both are dead. Drop them so
+        # they do not surface as `-- control flow` comments.
+        if inst.opname == "JMP" and inst.sbx == 0 and inst.index not in skip_indices:
+            skip_indices.add(inst.index)
+            if pos > 0 and meaningful[pos - 1].opname in _COMPARE_OPS and meaningful[pos - 1].index not in bool_value:
+                skip_indices.add(meaningful[pos - 1].index)
+
+    # Pass 2: if / if-else / while from a comparison or test followed by a
+    # forward JMP that skips the block when the condition is false. Block
+    # boundaries are emitted on arrival at the landing index (top of the main
+    # loop), so all jump targets use the real `pc += sbx + 1` landing address.
+    for inst in meaningful:
+        if inst.index in bool_value:
+            continue
+        following = next_meaningful.get(inst.index)
+        if inst.opname in {"EQ", "EQ_BK", "LT", "LT_BK", "LE", "LE_BK", "TEST", "TEST_R1"} and following and following.opname == "JMP" and following.sbx > 0:
+            land = following.index + following.sbx + 1
+            boundary = by_index.get(land - 1)
+            if (
+                boundary is not None
+                and boundary.opname == "JMP"
+                and boundary.index != following.index
+                and boundary.index not in generic_loop_ends
+                and boundary.index not in generic_loop_starts
+            ):
+                target = boundary.index + boundary.sbx + 1
+                if boundary.sbx > 0 and target > land:
+                    # then-block ends with a forward jump over an else-block.
+                    structured_ifs[inst.index] = (following, land, "if")
+                    else_after[land] = else_after.get(land, 0) + 1
+                    close_after[target] = close_after.get(target, 0) + 1
+                    skip_indices.add(boundary.index)
+                    continue
+                if boundary.sbx < 0 and target <= inst.index:
+                    # body ends with a backward jump to the test: a while loop.
+                    structured_ifs[inst.index] = (following, land, "while")
+                    close_after[land] = close_after.get(land, 0) + 1
+                    skip_indices.add(boundary.index)
+                    continue
+            structured_ifs[inst.index] = (following, land, "if")
+            close_after[land] = close_after.get(land, 0) + 1
+
+    def emit_block_boundaries(index: int) -> None:
+        nonlocal block_depth
+        for _ in range(close_after.get(index, 0)):
+            block_depth = max(0, block_depth - 1)
+            emit("end")
+        for _ in range(else_after.get(index, 0)):
+            block_depth = max(0, block_depth - 1)
+            emit("else")
+            block_depth += 1
+
+    pending_andor: dict[int, list[tuple[int, str, str]]] = {}
+
     for inst in proto.instructions:
+        # Close/continue any structured blocks that end at this instruction
+        # before emitting the instruction itself (the block's `end`/`else`
+        # belongs above the first statement that follows the block).
+        emit_block_boundaries(inst.index)
+        # Finalize any short-circuit and/or expression that lands here: the
+        # operand block has run and left its value in the destination register.
+        if inst.index in pending_andor:
+            for dst, b_expr, op_word in pending_andor.pop(inst.index):
+                current = regs.get(dst)
+                rewritten = False
+                # If the operand emitted an assignment (e.g. a call), splice the
+                # `a and/or` prefix into that already-emitted line.
+                if isinstance(current, str) and is_lua_identifier(current):
+                    pattern = re.compile(r"^(\s*)(local )?" + re.escape(current) + r" = (.*)$")
+                    for line_index in range(len(lines) - 1, -1, -1):
+                        match = pattern.match(lines[line_index])
+                        if match:
+                            lines[line_index] = (
+                                f"{match.group(1)}{match.group(2) or ''}{current} = "
+                                f"{b_expr} {op_word} {match.group(3)}"
+                            )
+                            rewritten = True
+                            break
+                if not rewritten:
+                    regs[dst] = f"({b_expr} {op_word} {expr(dst)})"
         if inst.index in skip_indices:
-            for _ in range(close_after.get(inst.index, 0)):
-                block_depth = max(0, block_depth - 1)
-                emit("end")
             continue
         op = inst.opname
         if op == "DATA":
-            for _ in range(close_after.get(inst.index, 0)):
-                block_depth = max(0, block_depth - 1)
-                emit("end")
+            continue
+        if inst.index in bool_value:
+            regs[bool_value[inst.index]] = f"({compare_value_text(inst)})"
+            continue
+        if op == "TESTSET" and inst.index in andor_start:
+            dst, _unused, op_word, target = andor_start[inst.index]
+            pending_andor.setdefault(target, []).append((dst, expr(inst.b), op_word))
             continue
         if inst.index in structured_ifs:
-            jump_inst, _ = structured_ifs[inst.index]
+            jump_inst, _, kind = structured_ifs[inst.index]
             condition = condition_text(inst)
-            emit(f"if {condition} then")
+            if kind == "while":
+                emit(f"while {condition} do")
+            else:
+                emit(f"if {condition} then")
             block_depth += 1
             skip_indices.add(jump_inst.index)
             continue
         if inst.index in generic_loop_starts:
             tfor_inst = generic_loop_starts[inst.index]
             iterator = expr(tfor_inst.a)
-            loop_vars = [register_name(reg) for reg in range(tfor_inst.a + 3, tfor_inst.a + 3 + max(tfor_inst.c, 1))]
-            for reg_name in loop_vars:
-                try:
-                    declared.add(int(reg_name.split("_", 1)[1]))
-                except (IndexError, ValueError):
-                    pass
+            loop_regs = list(range(tfor_inst.a + 3, tfor_inst.a + 3 + max(tfor_inst.c, 1)))
+            if "ipairs" in iterator:
+                hints = ["index", "value"]
+            elif "pairs" in iterator:
+                hints = ["key", "value"]
+            else:
+                hints = ["key", "value"]
+            loop_vars = [local_reg_name(reg, hints[pos] if pos < len(hints) else None) for pos, reg in enumerate(loop_regs)]
+            for reg in loop_regs:
+                declared.add(reg)
+                regs[reg] = local_reg_name(reg)
             emit(f"for {', '.join(loop_vars)} in {iterator} do")
             block_depth += 1
             continue
@@ -1486,7 +2048,11 @@ def source_lines_for_proto(
         elif op in {"SETUPVAL", "SETUPVAL_R1"}:
             emit(f"{upvalue_names.get(inst.b, f'upvalue_{inst.b}')} = {expr(inst.a)}")
         elif op == "MOVE":
-            regs[inst.a] = expr(inst.b)
+            moved = expr(inst.b)
+            if inst.a in declared and regs.get(inst.a) != moved:
+                assign(inst.a, moved)
+            else:
+                regs[inst.a] = moved
             emit_param_update(inst.a)
         elif op == "LOADK":
             regs[inst.a] = lua_literal(constant_value(proto, inst.bx))
@@ -1541,7 +2107,7 @@ def source_lines_for_proto(
                 table_fields.setdefault(inst.a, []).append((start_index + offset, expr(inst.a + offset)))
             refresh_table_expr(inst.a)
         elif op == "CLOSURE":
-            regs[inst.a] = proto_path_name((*path, inst.bx))
+            regs[inst.a] = names_by_path.get((*path, inst.bx)) or proto_path_name((*path, inst.bx))
         elif op == "SELF":
             base = expr(inst.b)
             method = self_field_value(proto, inst.c)
@@ -1603,7 +2169,10 @@ def source_lines_for_proto(
             if inst.a in declared:
                 assign(inst.a, regs[inst.a])
         elif op == "FORPREP":
-            emit(f"for {register_name(inst.a + 3)} = {expr(inst.a)}, {expr(inst.a + 1)}, {expr(inst.a + 2)} do")
+            loop_name = local_reg_name(inst.a + 3, "index")
+            declared.add(inst.a + 3)
+            regs[inst.a + 3] = loop_name
+            emit(f"for {loop_name} = {expr(inst.a)}, {expr(inst.a + 1)}, {expr(inst.a + 2)} do")
             block_depth += 1
         elif op == "FORLOOP":
             block_depth = max(0, block_depth - 1)
@@ -1616,10 +2185,6 @@ def source_lines_for_proto(
             emit(f"-- control flow: {readable_instruction_comment(proto, inst)[3:]}")
         else:
             emit(f"-- unresolved: {readable_instruction_comment(proto, inst)[3:]}")
-
-        for _ in range(close_after.get(inst.index, 0)):
-            block_depth = max(0, block_depth - 1)
-            emit("end")
 
     return strip_trailing_control_comments(lines) or [f"{indent}-- empty function"]
 
@@ -1716,37 +2281,195 @@ def infer_event_upvalue_names(proto: Proto) -> dict[int, str]:
     regs: dict[int, Any] = {}
     methods: dict[int, tuple[str, Any]] = {}
     names: dict[int, str] = {}
+    # Registers currently holding a real string constant (from LOADK). Only
+    # these are trusted as event-name literals; a plain register fallback name
+    # like "local_1" must never be mistaken for an event string.
+    const_str_regs: set[int] = set()
 
     def value(reg: int) -> Any:
         return regs.get(reg, register_name(reg))
+
+    def clear(reg: int) -> None:
+        const_str_regs.discard(reg)
 
     for inst in proto.instructions:
         op = inst.opname
         if op == "GETGLOBAL":
             regs[inst.a] = constant_name(proto, inst.bx)
+            clear(inst.a)
         elif op in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
             regs[inst.a] = field_expr(str(value(inst.b)), constant_value(proto, inst.c))
+            clear(inst.a)
         elif op == "LOADK":
-            regs[inst.a] = constant_value(proto, inst.bx)
+            constant = constant_value(proto, inst.bx)
+            regs[inst.a] = constant
+            if isinstance(constant, str):
+                const_str_regs.add(inst.a)
+            else:
+                clear(inst.a)
         elif op == "MOVE":
             regs[inst.a] = value(inst.b)
+            if inst.b in const_str_regs:
+                const_str_regs.add(inst.a)
+            else:
+                clear(inst.a)
         elif op == "GETUPVAL":
             regs[inst.a] = ("upvalue", inst.b)
+            clear(inst.a)
         elif op == "SELF":
             base = str(value(inst.b))
             method = self_field_value(proto, inst.c)
             regs[inst.a] = field_expr(base, method)
             regs[inst.a + 1] = base
             methods[inst.a] = (base, method)
+            clear(inst.a)
+            clear(inst.a + 1)
         elif op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
             if inst.a in methods:
                 _, method = methods.pop(inst.a)
-                args = [value(reg) for reg in range(inst.a + 2, inst.a + max(inst.b, 1))]
-                if method == "registerEventHandler" and len(args) >= 2 and isinstance(args[0], str):
-                    handler = args[1]
+                name_reg = inst.a + 2
+                handler_reg = inst.a + 3
+                if (
+                    method == "registerEventHandler"
+                    and inst.b >= 3
+                    and name_reg in const_str_regs
+                    and isinstance(regs.get(name_reg), str)
+                ):
+                    handler = regs.get(handler_reg)
                     if isinstance(handler, tuple) and handler[0] == "upvalue":
-                        names[int(handler[1])] = sanitize_local_name(args[0], f"upvalue_{handler[1]}")
+                        names[int(handler[1])] = sanitize_local_name(
+                            regs[name_reg], f"upvalue_{handler[1]}"
+                        )
     return names
+
+
+def guess_local_function_name(child: Proto) -> str | None:
+    """Best-effort readable name for an anonymous local function.
+
+    Uses the returned constructor (`return X.new(...)`) as the strongest hint,
+    which is common for BO2 UI factory helpers. Returns None when nothing
+    reliable can be inferred so the caller can fall back to a stable name.
+    """
+    insts = [inst for inst in child.instructions if inst.opname != "DATA"]
+    returned: set[int] = set()
+    for inst in insts:
+        if inst.opname == "RETURN" and inst.b > 1:
+            returned.update(range(inst.a, inst.a + inst.b - 1))
+    if not returned:
+        return None
+    reg_expr: dict[int, str] = {}
+    for inst in insts:
+        if inst.opname == "GETGLOBAL":
+            reg_expr[inst.a] = constant_name(child, inst.bx)
+        elif inst.opname in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            base = reg_expr.get(inst.b)
+            field = constant_value(child, inst.c)
+            reg_expr[inst.a] = f"{base}.{field}" if base and isinstance(field, str) else ""
+        elif inst.opname in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+            callee = reg_expr.get(inst.a) or ""
+            if inst.a in returned and callee:
+                last = callee.rsplit(".", 1)[-1]
+                owner = callee.rsplit(".", 1)[0].rsplit(".", 1)[-1] if "." in callee else ""
+                if last in {"new", "New"} and owner:
+                    return "create" + owner[:1].upper() + owner[1:]
+            reg_expr.pop(inst.a, None)
+    return None
+
+
+def resolve_root_children(
+    proto: Proto,
+) -> tuple[dict[int, str], dict[int, str], dict[int, list[tuple[str, Any]]]]:
+    """Assign one consistent name to every root child function.
+
+    Returns (export_names, local_names, upvalue_bindings) where:
+      * export_names maps child index -> dotted export (`CoD.X.Foo`);
+      * local_names maps child index -> a `local function` name for children that
+        are captured as upvalues by other children;
+      * upvalue_bindings maps child index -> per-upvalue binding descriptors so
+        every GETUPVAL resolves to the exact same name used at the declaration.
+    """
+    exports = recover_root_child_exports(proto)
+    insts = proto.instructions
+
+    # Upvalues here are captured as OPEN references to parent register slots;
+    # the closure that ends up in a slot may be created later in the root
+    # (module-level local functions). Pre-scan every CLOSURE-to-slot assignment
+    # so forward-referenced captures still resolve to the right child.
+    slot_child: dict[int, int] = {}
+    for inst in insts:
+        if inst.opname == "CLOSURE":
+            slot_child[inst.a] = inst.bx
+        elif inst.opname == "MOVE" and inst.b in slot_child:
+            slot_child[inst.a] = slot_child[inst.b]
+
+    reg_expr: dict[int, str] = {}
+    bindings: dict[int, list[tuple[str, Any]]] = {}
+    i = 0
+    while i < len(insts):
+        inst = insts[i]
+        op = inst.opname
+        if op == "GETGLOBAL":
+            reg_expr[inst.a] = constant_name(proto, inst.bx)
+        elif op in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            base = reg_expr.get(inst.b)
+            field = constant_value(proto, inst.c)
+            reg_expr[inst.a] = field_expr(base, field) if base else ""
+        elif op == "MOVE" and inst.b in reg_expr:
+            reg_expr[inst.a] = reg_expr[inst.b]
+        elif op == "CLOSURE":
+            ups: list[tuple[str, Any]] = []
+            j = i + 1
+            while j < len(insts) and insts[j].opname == "DATA":
+                data = insts[j]
+                if data.a == 1:
+                    reg = data.c
+                    if reg in slot_child:
+                        ups.append(("child", slot_child[reg]))
+                    elif reg_expr.get(reg):
+                        ups.append(("expr", reg_expr[reg]))
+                    else:
+                        ups.append(("reg", reg))
+                j += 1
+            if ups:
+                bindings[inst.bx] = ups
+        i += 1
+
+    # Children captured as upvalues need a stable local name.
+    referenced: set[int] = set()
+    for ups in bindings.values():
+        for kind, val in ups:
+            if kind == "child":
+                referenced.add(int(val))
+
+    local_names: dict[int, str] = {}
+    # Event-handler names are the strongest signal: a child that registers
+    # another child as a handler names it after the event string.
+    for child_index in range(len(proto.children)):
+        handler_names = infer_event_upvalue_names(proto.children[child_index])
+        for upvalue_index, name in handler_names.items():
+            ups = bindings.get(child_index, [])
+            if upvalue_index < len(ups) and ups[upvalue_index][0] == "child":
+                local_names.setdefault(int(ups[upvalue_index][1]), name)
+
+    used = set(local_names.values())
+    counter = 1
+    for child_index in sorted(referenced):
+        if child_index in exports or child_index in local_names:
+            continue
+        if not (0 <= child_index < len(proto.children)):
+            continue
+        guessed = guess_local_function_name(proto.children[child_index])
+        candidate = guessed or f"localFunction{counter}"
+        base = candidate
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}{suffix}"
+            suffix += 1
+        used.add(candidate)
+        local_names[child_index] = candidate
+        if not guessed:
+            counter += 1
+    return exports, local_names, bindings
 
 
 def can_use_function_statement(name: str) -> bool:
@@ -1759,9 +2482,12 @@ def decompile_child_function(
     export_name: str | None = None,
     local_name: str | None = None,
     upvalue_names: dict[int, str] | None = None,
+    names_by_path: dict[tuple[int, ...], str] | None = None,
 ) -> list[str]:
     name = local_name or proto_path_name(path)
-    params = ", ".join(source_params(proto, infer=True))
+    func_name = export_name or name
+    is_local = export_name is None
+    params = ", ".join(source_params(proto, infer=True, func_name=func_name, is_local=is_local))
     if export_name:
         if can_use_function_statement(export_name):
             lines = [f"function {export_name}({params})"]
@@ -1770,7 +2496,18 @@ def decompile_child_function(
     else:
         lines = [f"local function {name}({params})"]
     if proto.instructions:
-        lines.extend(source_lines_for_proto(proto, path, "  ", infer_params=True, upvalue_names=upvalue_names))
+        lines.extend(
+            source_lines_for_proto(
+                proto,
+                path,
+                "  ",
+                infer_params=True,
+                upvalue_names=upvalue_names,
+                func_name=func_name,
+                is_local=is_local,
+                names_by_path=names_by_path,
+            )
+        )
     lines.append("end")
     return lines
 
@@ -1804,6 +2541,82 @@ def root_approx_statements(proto: Proto) -> list[str]:
     return lines
 
 
+def build_naming(
+    root: Proto,
+) -> tuple[dict[tuple[int, ...], str], dict[tuple[int, ...], str], dict[tuple[int, ...], dict[int, str]]]:
+    """Assign one consistent name to every function at every depth.
+
+    Walks each proto that defines child closures, reusing resolve_root_children,
+    so nested (depth-2+) functions and their upvalue references share the same
+    name everywhere instead of leaking `fn_<a>_<b>` placeholders.
+    """
+    names_by_path: dict[tuple[int, ...], str] = {}
+    export_by_path: dict[tuple[int, ...], str] = {}
+    upvalues_by_path: dict[tuple[int, ...], dict[int, str]] = {}
+    generic_counter = 0
+
+    for path, parent in iter_protos(root):
+        exports, local_names, bindings = resolve_root_children(parent)
+        used: set[str] = set()
+
+        def unique(base: str) -> str:
+            candidate = base
+            suffix = 2
+            while candidate in used:
+                candidate = f"{base}{suffix}"
+                suffix += 1
+            used.add(candidate)
+            return candidate
+
+        # Some child prototypes fail to parse (unknown nested descriptor), so the
+        # parsed children list can be shorter than the closures referenced by the
+        # bytecode. Name every index the instruction stream refers to so CLOSURE
+        # references still resolve to a real name instead of an fn_<n> placeholder.
+        max_index = len(parent.children)
+        for idx in exports:
+            max_index = max(max_index, idx + 1)
+        for idx in local_names:
+            max_index = max(max_index, idx + 1)
+        for ups in bindings.values():
+            for kind, val in ups:
+                if kind == "child":
+                    max_index = max(max_index, int(val) + 1)
+
+        for child_index in range(max_index):
+            cpath = (*path, child_index)
+            if child_index in exports:
+                export_by_path[cpath] = exports[child_index]
+                names_by_path[cpath] = exports[child_index]
+                used.add(exports[child_index])
+            elif child_index in local_names:
+                names_by_path[cpath] = unique(local_names[child_index])
+            elif child_index < len(parent.children):
+                guessed = guess_local_function_name(parent.children[child_index])
+                if guessed:
+                    names_by_path[cpath] = unique(guessed)
+                else:
+                    generic_counter += 1
+                    names_by_path[cpath] = unique(f"callback{generic_counter}")
+            else:
+                generic_counter += 1
+                names_by_path[cpath] = unique(f"callback{generic_counter}")
+
+        for child_index in range(len(parent.children)):
+            cpath = (*path, child_index)
+            resolved: dict[int, str] = {}
+            for upvalue_index, (kind, val) in enumerate(bindings.get(child_index, [])):
+                if kind == "child" and 0 <= int(val) < len(parent.children):
+                    sib = (*path, int(val))
+                    resolved[upvalue_index] = names_by_path.get(sib) or proto_path_name(sib)
+                elif kind == "expr":
+                    resolved[upvalue_index] = str(val)
+                else:
+                    resolved[upvalue_index] = f"upvalue{upvalue_index}"
+            upvalues_by_path[cpath] = resolved
+
+    return names_by_path, export_by_path, upvalues_by_path
+
+
 def readable_lua(proto: Proto, source_name: str = "") -> str:
     lines = [
         "-- BO2 Xbox/Treyarch Lua decompile",
@@ -1813,41 +2626,28 @@ def readable_lua(proto: Proto, source_name: str = "") -> str:
         lines.append(f"-- Source payload: {source_name}")
     lines.append("")
 
-    root_exports = recover_root_child_exports(proto)
-    child_upvalues = recover_root_child_upvalues(proto)
-    local_child_names: dict[int, str] = {}
-    for child_index, upvalues in child_upvalues.items():
-        if 0 <= child_index < len(proto.children):
-            inferred_upvalue_names = infer_event_upvalue_names(proto.children[child_index])
-            for upvalue_index, name in inferred_upvalue_names.items():
-                bound_name = upvalues.get(upvalue_index)
-                if bound_name and bound_name.startswith("fn_"):
-                    try:
-                        bound_index = int(bound_name[3:])
-                    except ValueError:
-                        continue
-                    local_child_names.setdefault(bound_index, name)
-    skipped_root_values = {proto_path_name((child_index,)) for child_index in root_exports}
+    names_by_path, export_by_path, upvalues_by_path = build_naming(proto)
+
+    skipped_root_values = {
+        name for path, name in names_by_path.items() if len(path) == 1 and path in export_by_path
+    }
     if proto.instructions:
-        lines.extend(source_lines_for_proto(proto, (), "", skip_assigned_values=skipped_root_values))
+        lines.extend(
+            source_lines_for_proto(
+                proto, (), "", skip_assigned_values=skipped_root_values, names_by_path=names_by_path
+            )
+        )
         lines.append("")
 
     for path, child in iter_protos(proto):
         if not path:
             continue
-        export_name = root_exports.get(path[0]) if len(path) == 1 else None
-        local_name = local_child_names.get(path[0]) if len(path) == 1 else None
-        raw_upvalue_names = child_upvalues.get(path[0], {}) if len(path) == 1 else {}
-        upvalue_names = {}
-        for upvalue_index, bound_name in raw_upvalue_names.items():
-            resolved_name = bound_name
-            if bound_name.startswith("fn_"):
-                try:
-                    resolved_name = local_child_names.get(int(bound_name[3:]), bound_name)
-                except ValueError:
-                    resolved_name = bound_name
-            upvalue_names[upvalue_index] = resolved_name
-        lines.extend(decompile_child_function(child, path, export_name, local_name, upvalue_names))
+        export_name = export_by_path.get(path)
+        local_name = names_by_path.get(path) if path not in export_by_path else None
+        upvalue_names = upvalues_by_path.get(path, {})
+        lines.extend(
+            decompile_child_function(child, path, export_name, local_name, upvalue_names, names_by_path)
+        )
         lines.append("")
 
     lines.append("")

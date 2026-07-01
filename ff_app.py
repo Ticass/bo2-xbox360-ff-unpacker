@@ -85,6 +85,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
     decompressed_zone = metadata.get("decompressed_zone", {})
     scripts = decompressed_zone.get("embedded_scripts", {}).get("count", 0)
     lua_files = decompressed_zone.get("embedded_lua", {}).get("count", 0)
+    menu_files = decompressed_zone.get("embedded_menu", {}).get("count", 0)
     partial = decompressed_zone.get("partial_zone", False)
     chunk_errors = decompressed_zone.get("chunk_errors", [])
     lua_decompiled = 0
@@ -116,14 +117,17 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
         except Exception:
             lua_asm = 0
     result_readme = out_dir / "README_EXTRACT_RESULT.txt"
-    if scripts or lua_files:
+    if scripts or lua_files or menu_files:
         found_lines = [
             f"Compiled GSC/CSC script payloads extracted: {scripts}",
             f"Compiled Lua UI payloads extracted: {lua_files}",
+            f"Menu (.menu) payloads extracted: {menu_files}",
         ]
         folder_lines = []
         if scripts:
             folder_lines.extend(["Open the scripts folder for extracted .gsc/.csc payloads:", str(out_dir / "scripts"), ""])
+        if menu_files:
+            folder_lines.extend(["Open the menus folder for extracted .menu payloads:", str(out_dir / "menus"), ""])
         if lua_files:
             folder_lines.extend(["Open the ui_lua folder for extracted .lua bytecode payloads:", str(out_dir / "ui_lua"), ""])
             folder_lines.extend(["Open the ui_lua_readable folder for readable Lua decompile:", str(lua_readable_out), ""])
@@ -176,6 +180,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
         "metadata": str(metadata_path),
         "scripts": scripts,
         "lua_files": lua_files,
+        "menu_files": menu_files,
         "lua_decompiled": lua_decompiled,
         "lua_readable": lua_readable,
         "lua_asm": lua_asm,

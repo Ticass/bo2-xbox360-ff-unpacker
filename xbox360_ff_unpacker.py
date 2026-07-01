@@ -1420,6 +1420,101 @@ def extract_embedded_lua_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
     }
 
 
+def extract_embedded_menu_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
+    """Extract embedded `.menu` blobs verbatim by local path/pointer pattern.
+
+    Menu payloads that use the same self-describing container as scripts/Lua:
+
+        FFFFFFFF <be length> FFFFFFFF "<path>.menu\\0" <payload bytes>
+
+    Per the extraction contract, `.menu` files are copied out exactly as stored.
+    No attempt is made to decide whether the payload is compiled or plaintext,
+    and no payload magic is required. Most BO2 UI is LUI (`.lua`); classic
+    `menuDef_t` assets that are not stored as contiguous pointer blobs are not
+    recovered here and still require the zone asset-stream parser.
+    """
+
+    menu_dir = out_dir / "assets" / "embedded_menu"
+    friendly_menu_dir = out_dir / "menus"
+    menu_dir.mkdir(parents=True, exist_ok=True)
+    friendly_menu_dir.mkdir(parents=True, exist_ok=True)
+    pattern = rb"[\x20-\x7e]{3,}\.menu"
+    reports: list[dict[str, Any]] = []
+    seen_paths: dict[str, int] = {}
+
+    for match in re.finditer(pattern, data, flags=re.IGNORECASE):
+        path_offset = match.start()
+        header_offset = path_offset - 12
+        if header_offset < 0:
+            continue
+        name_ptr = be_u32(data, header_offset)
+        length = be_u32(data, header_offset + 4)
+        buffer_ptr = be_u32(data, header_offset + 8)
+        if name_ptr != 0xFFFFFFFF or buffer_ptr != 0xFFFFFFFF:
+            continue
+        if length == 0 or length > 64 * 1024 * 1024:
+            continue
+
+        path_end = data.find(b"\x00", path_offset, path_offset + 512)
+        if path_end < 0:
+            continue
+        menu_name = data[path_offset:path_end].decode("ascii", "replace")
+        payload_offset = path_end + 1
+        payload_end = payload_offset + length
+        if payload_end > len(data):
+            continue
+        payload = data[payload_offset:payload_end]
+
+        rel = safe_asset_path(menu_name, ".menu")
+        key = str(rel).lower()
+        duplicate_index = seen_paths.get(key, 0)
+        seen_paths[key] = duplicate_index + 1
+        if duplicate_index:
+            rel = rel.with_name(f"{rel.stem}_{path_offset:08x}{rel.suffix}")
+        output_path = menu_dir / rel
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(payload)
+
+        friendly_output_path = friendly_menu_dir / rel
+        friendly_output_path.parent.mkdir(parents=True, exist_ok=True)
+        friendly_output_path.write_bytes(payload)
+
+        reports.append(
+            {
+                "menu_name": menu_name,
+                "header_offset": header_offset,
+                "path_offset": path_offset,
+                "payload_offset": payload_offset,
+                "payload_size": length,
+                "payload_head_hex": payload[:16].hex(),
+                "path": str(output_path),
+                "friendly_path": str(friendly_output_path),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "extraction_confidence": "high",
+                "confidence_reason": "Local following-name/following-buffer header and .menu path match.",
+            }
+        )
+
+    manifest_path = out_dir / "embedded_menu.json"
+    write_json(
+        manifest_path,
+        {
+            "status": "ok",
+            "count": len(reports),
+            "menu_root": str(friendly_menu_dir),
+            "note": "Extracted .menu files are copied verbatim from the zone; they are not parsed or decompiled.",
+            "menu_files": reports,
+        },
+    )
+    return {
+        "status": "ok",
+        "count": len(reports),
+        "manifest_path": str(manifest_path),
+        "menu_root": str(friendly_menu_dir),
+        "menu_sample": reports[:50],
+    }
+
+
 def build_readable_string_inventory(data: bytes, out_dir: Path, min_len: int = 5) -> dict[str, Any]:
     all_path = out_dir / "readable_strings.tsv"
     interesting_path = out_dir / "interesting_strings.tsv"
@@ -1963,6 +2058,7 @@ class FastFileScanner:
                 asset_stream_trace = {"status": "failed", "error": str(exc)}
         embedded_scripts = extract_embedded_script_blobs(zone_data, out_dir)
         embedded_lua = extract_embedded_lua_blobs(zone_data, out_dir)
+        embedded_menu = extract_embedded_menu_blobs(zone_data, out_dir)
         if top_level.get("script_strings", {}).get("strings"):
             script_strings_path = out_dir / "script_strings.txt"
             script_strings_path.write_text(
@@ -2010,6 +2106,7 @@ class FastFileScanner:
             "asset_stream_trace": asset_stream_trace,
             "embedded_scripts": embedded_scripts,
             "embedded_lua": embedded_lua,
+            "embedded_menu": embedded_menu,
             "readable_string_inventory": build_readable_string_inventory(zone_data, out_dir),
             "first_64_bytes": hex_sample(zone_data, 0, 64),
             "chunks": chunk_reports,
