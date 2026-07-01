@@ -1487,13 +1487,22 @@ def source_params(
     func_name: str | None = None,
     is_local: bool = False,
 ) -> list[str]:
+    def append_unique(names: list[str], base: str) -> None:
+        candidate = base
+        suffix = 2
+        used = set(names)
+        while candidate in used:
+            candidate = f"{base}{suffix}"
+            suffix += 1
+        names.append(candidate)
+
     inferred = infer_param_names(proto, func_name=func_name, is_local=is_local)
     if inferred is not None and len(inferred) >= proto.param_count > 0:
         # Extend with inferred extra input registers if the caller wants them.
         if infer:
             extra = len(infer_input_registers(proto)) - len(inferred)
-            for offset in range(max(extra, 0)):
-                inferred.append(f"value{len(inferred) + offset}")
+            for _offset in range(max(extra, 0)):
+                append_unique(inferred, f"value{len(inferred)}")
         return inferred
     count = proto.param_count
     if infer:
@@ -2442,6 +2451,153 @@ def infer_event_upvalue_names(proto: Proto) -> dict[int, str]:
                         names[int(handler[1])] = sanitize_local_name(
                             regs[name_reg], f"upvalue_{handler[1]}"
                         )
+                if isinstance(method, str):
+                    for arg_pos, reg in enumerate(range(inst.a + 1, inst.a + max(inst.b, 1))):
+                        handler = regs.get(reg)
+                        if isinstance(handler, tuple) and handler[0] == "upvalue":
+                            candidate = child_name_from_method_arg(method, arg_pos)
+                            if candidate:
+                                names.setdefault(int(handler[1]), candidate)
+            else:
+                callee = regs.get(inst.a)
+                if isinstance(callee, str):
+                    for arg_pos, reg in enumerate(range(inst.a + 1, inst.a + max(inst.b, 1))):
+                        handler = regs.get(reg)
+                        if isinstance(handler, tuple) and handler[0] == "upvalue":
+                            candidate = child_name_from_method_arg(callee, arg_pos)
+                            if candidate:
+                                names.setdefault(int(handler[1]), candidate)
+        elif op in {"SETFIELD", "SETFIELD_R1"}:
+            handler = regs.get(inst.c)
+            field = constant_value(proto, inst.b)
+            if isinstance(handler, tuple) and handler[0] == "upvalue" and isinstance(field, str):
+                names.setdefault(int(handler[1]), sanitize_local_name(field, f"upvalue_{handler[1]}"))
+        elif op in {"SETTABLE_S", "SETTABLE_S_BK"}:
+            handler = regs.get(inst.c)
+            key = constant_value(proto, inst.b)
+            if isinstance(handler, tuple) and handler[0] == "upvalue" and isinstance(key, str):
+                names.setdefault(int(handler[1]), sanitize_local_name(key, f"upvalue_{handler[1]}"))
+    return names
+
+
+def child_name_from_method_arg(method: str, arg_pos: int) -> str | None:
+    """Name a closure from the API argument slot it is passed to."""
+    known: dict[str, dict[int, str]] = {
+        "registerEventHandler": {1: "handleEvent"},
+        "addCardCarousel": {2: "populateCardCarousel"},
+        "ScrollableContentGrid.new": {4: "handleButtonOver", 5: "handleButtonGainFocus"},
+        "table.sort": {1: "compareItems"},
+    }
+    if method in known and arg_pos in known[method]:
+        return known[method][arg_pos]
+    if arg_pos == 0 and method.startswith("set") and len(method) > 3:
+        return camel_from_parts(["set", method[3:]], "setValue")
+    if arg_pos == 0 and method.startswith("add") and len(method) > 3:
+        return camel_from_parts(["add", method[3:]], "addValue")
+    return None
+
+
+def infer_parent_child_names(proto: Proto) -> dict[int, str]:
+    """Infer child names from the parent instruction stream.
+
+    This catches local helpers whose own stripped bytecode has no name, but
+    whose closure is assigned to a meaningful field (`button.isSelected = f`) or
+    passed to a named callback slot (`registerEventHandler("x", f)`).
+    """
+    regs: dict[int, Any] = {}
+    closure_regs: dict[int, int] = {}
+    methods: dict[int, tuple[str, str | Any]] = {}
+    names: dict[int, str] = {}
+    const_str_regs: set[int] = set()
+
+    def value(reg: int) -> Any:
+        return regs.get(reg, register_name(reg))
+
+    def clear(reg: int) -> None:
+        closure_regs.pop(reg, None)
+        const_str_regs.discard(reg)
+
+    def note(child_index: int | None, candidate: str | None) -> None:
+        if child_index is None or not candidate:
+            return
+        if child_index in names:
+            return
+        names[child_index] = sanitize_local_name(candidate, f"inferredFunction{child_index + 1}")
+
+    for inst in proto.instructions:
+        op = inst.opname
+        if op == "GETGLOBAL":
+            regs[inst.a] = constant_name(proto, inst.bx)
+            clear(inst.a)
+        elif op == "LOADK":
+            constant = constant_value(proto, inst.bx)
+            regs[inst.a] = constant
+            closure_regs.pop(inst.a, None)
+            if isinstance(constant, str):
+                const_str_regs.add(inst.a)
+            else:
+                const_str_regs.discard(inst.a)
+        elif op in {"GETFIELD", "GETFIELD_R1", "GETFIELD_MM"}:
+            regs[inst.a] = field_expr(str(value(inst.b)), constant_value(proto, inst.c))
+            clear(inst.a)
+        elif op == "MOVE":
+            regs[inst.a] = value(inst.b)
+            if inst.b in closure_regs:
+                closure_regs[inst.a] = closure_regs[inst.b]
+            else:
+                closure_regs.pop(inst.a, None)
+            if inst.b in const_str_regs:
+                const_str_regs.add(inst.a)
+            else:
+                const_str_regs.discard(inst.a)
+        elif op == "CLOSURE":
+            regs[inst.a] = proto_path_name((inst.bx,))
+            closure_regs[inst.a] = inst.bx
+            const_str_regs.discard(inst.a)
+        elif op == "SELF":
+            base = str(value(inst.b))
+            method = self_field_value(proto, inst.c)
+            regs[inst.a] = field_expr(base, method)
+            regs[inst.a + 1] = base
+            methods[inst.a] = (base, method)
+            clear(inst.a)
+            clear(inst.a + 1)
+        elif op in {"SETFIELD", "SETFIELD_R1"}:
+            child_index = closure_regs.get(inst.c)
+            field = constant_value(proto, inst.b)
+            if isinstance(field, str):
+                note(child_index, field)
+        elif op == "SETTABLE_S":
+            child_index = closure_regs.get(inst.c)
+            key = constant_value(proto, inst.b)
+            if isinstance(key, str):
+                note(child_index, key)
+        elif op == "SETTABLE_S_BK":
+            child_index = closure_regs.get(inst.c)
+            key = constant_value(proto, inst.b)
+            if isinstance(key, str):
+                note(child_index, key)
+        elif op in {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}:
+            method_name: str | None = None
+            if inst.a in methods:
+                _base, method = methods.pop(inst.a)
+                method_name = str(method)
+                if method_name == "registerEventHandler" and inst.b >= 4:
+                    event_name = regs.get(inst.a + 2)
+                    child_index = closure_regs.get(inst.a + 3)
+                    if inst.a + 2 in const_str_regs and isinstance(event_name, str):
+                        note(child_index, camel_from_label(event_name, "handleEvent", "handle"))
+            else:
+                callee = regs.get(inst.a)
+                if isinstance(callee, str):
+                    method_name = callee
+            if method_name:
+                for arg_pos, reg in enumerate(range(inst.a + 1, inst.a + max(inst.b, 1))):
+                    child_index = closure_regs.get(reg)
+                    note(child_index, child_name_from_method_arg(method_name, arg_pos))
+            regs.pop(inst.a, None)
+            closure_regs.pop(inst.a, None)
+            const_str_regs.discard(inst.a)
     return names
 
 
@@ -2551,6 +2707,7 @@ def resolve_root_children(
         every GETUPVAL resolves to the exact same name used at the declaration.
     """
     exports = recover_root_child_exports(proto)
+    parent_names = infer_parent_child_names(proto)
     insts = proto.instructions
 
     # Upvalues here are captured as OPEN references to parent register slots;
@@ -2604,6 +2761,10 @@ def resolve_root_children(
                 referenced.add(int(val))
 
     local_names: dict[int, str] = {}
+    for child_index, name in parent_names.items():
+        if child_index not in exports:
+            local_names.setdefault(child_index, name)
+
     # Event-handler names are the strongest signal: a child that registers
     # another child as a handler names it after the event string.
     for child_index in range(len(proto.children)):

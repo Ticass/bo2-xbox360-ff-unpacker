@@ -149,7 +149,10 @@ Lua bytecode tool status:
   every upvalue reference. Open-upvalue captures to parent register slots are
   resolved via a whole-root closure pre-scan, so forward-referenced module-level
   local functions bind correctly. Anonymous factory helpers are named from their
-  returned constructor (`return X.new(...)` -> `createX`).
+  returned constructor (`return X.new(...)` -> `createX`). Parent-side call-site
+  and assignment clues are also used now, so captured helpers can be named from
+  `registerEventHandler("streamed_image_ready", f)` -> `handleStreamedImageReady`
+  and `button.isSelected = f` -> `isSelected`.
 - The unpacker also carves `.menu` payloads verbatim (`extract_embedded_menu_blobs`)
   into `menus/` alongside `scripts/` and `ui_lua/`. Most BO2 UI is LUI (`.lua`);
   classic `menuDef_t` assets not stored as contiguous pointer blobs still need
@@ -160,13 +163,17 @@ Lua bytecode tool status:
   captured values; the `restrictitems` attachment loop still uses an explicit
   `goto` instead of a higher-level loop; and there is still no readable-source ->
   bytecode compiler (recompilation is currently lossless-bytecode / offset-patch
-  only).
+  only). Current MP/ZM readable output still contains 340 explicit
+  `inferredFunction`/`inferredCallback`/`capturedValue` markers where no stronger
+  naming evidence has been found yet.
 - `lua_tool.py` parses the Treyarch Lua type table, root prototype metadata,
   root instruction stream, constants, and observed nested closure bodies.
 - `lua_tool.py decompile-source` / `decompile-source-dir` write readable Lua
   decompiled source with recovered top-level assignments, function parameters,
   table constructors, method calls, recovered upvalue bindings, simple branches,
-  numeric loops, and comments for unresolved operations.
+  numeric loops, and generic loops. Current MP/ZM verification has zero
+  unresolved-opcode/control-flow comments and zero duplicate function parameter
+  names.
 - Current readable-source improvements recover root-exported function names
   such as `CoD.TextFieldButton.new`, captured event-handler locals such as
   `button_over`, simple boolean `TEST` branches, early returns, and root
@@ -175,9 +182,8 @@ Lua bytecode tool status:
 - Additional opcode recovery handles `SETLIST` array table literals,
   `SETTABLE_S_BK` constant-key/constant-value table writes, `_BK` arithmetic
   variants, and common generic `for` loops produced by `ipairs`/`pairs` style
-  iterators. The current MP/ZM sample set has no remaining unresolved opcode
-  comments in `ui_lua_readable`; remaining comments are control-flow `JMP`
-  shapes that still need structural recovery.
+  iterators. The current MP/ZM sample set has no remaining unresolved opcode or
+  control-flow comments in `ui_lua_readable`.
 - Xbox 360 stores Havok/T6 instruction words big-endian. The decoded fields
   match the known T6 Havok opcode packing after reversing each 4-byte
   instruction word for field extraction.
