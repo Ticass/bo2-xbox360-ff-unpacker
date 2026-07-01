@@ -37,6 +37,9 @@ zombie_blabla\
 ```
 
 Use **Open Selected Output** in the app to jump straight to a completed folder.
+For Lua-bearing fastfiles, the result table also shows readable Lua,
+decompiled listing, and HKSASM counts, with quick buttons for opening the
+readable/decompiled Lua folders.
 
 ## Main tools
 

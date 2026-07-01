@@ -338,13 +338,23 @@ class FastFileApp:
 
         table_frame = ttk.Frame(outer)
         table_frame.pack(fill=BOTH, expand=True, pady=(16, 10))
-        self.tree = ttk.Treeview(table_frame, columns=("status", "scripts", "output"), show="headings")
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=("status", "scripts", "lua_readable", "lua_decompiled", "lua_asm", "output"),
+            show="headings",
+        )
         self.tree.heading("status", text="Status")
-        self.tree.heading("scripts", text="GSC/CSC / Lua")
+        self.tree.heading("scripts", text="Scripts / Lua")
+        self.tree.heading("lua_readable", text="Readable Lua")
+        self.tree.heading("lua_decompiled", text="Decompiled")
+        self.tree.heading("lua_asm", text="HKSASM")
         self.tree.heading("output", text="Output")
-        self.tree.column("status", width=150, anchor="w")
-        self.tree.column("scripts", width=90, anchor="center")
-        self.tree.column("output", width=620, anchor="w")
+        self.tree.column("status", width=135, anchor="w")
+        self.tree.column("scripts", width=85, anchor="center")
+        self.tree.column("lua_readable", width=95, anchor="center")
+        self.tree.column("lua_decompiled", width=90, anchor="center")
+        self.tree.column("lua_asm", width=75, anchor="center")
+        self.tree.column("output", width=430, anchor="w")
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         scrollbar.pack(side=RIGHT, fill="y")
@@ -353,6 +363,8 @@ class FastFileApp:
         footer = ttk.Frame(outer)
         footer.pack(fill=X)
         ttk.Button(footer, text="Open Selected Output", command=self.open_selected_output).pack(side=LEFT)
+        ttk.Button(footer, text="Open Readable Lua", command=lambda: self.open_selected_subfolder("ui_lua_readable")).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(footer, text="Open Decompiled Lua", command=lambda: self.open_selected_subfolder("ui_lua_decompiled")).pack(side=LEFT, padx=(8, 0))
         ttk.Button(footer, text="Clear List", command=self.clear_list).pack(side=LEFT, padx=(8, 0))
 
     def select_game_folder(self) -> None:
@@ -414,7 +426,7 @@ class FastFileApp:
                 continue
             self.pending_files.append(path)
             item_id = str(path)
-            self.tree.insert("", END, iid=item_id, values=("Queued", "-", str(ff_output_dir(path))))
+            self.tree.insert("", END, iid=item_id, values=("Queued", "-", "-", "-", "-", str(ff_output_dir(path))))
 
         self.status_text.set(f"Queued {len(files)} file(s).")
         if auto_start:
@@ -468,6 +480,7 @@ class FastFileApp:
             scripts = result.get("scripts", 0)
             lua_files = result.get("lua_files", 0)
             lua_readable = result.get("lua_readable", 0)
+            lua_decompiled = result.get("lua_decompiled", 0)
             lua_asm = result.get("lua_asm", 0)
             if scripts:
                 status = "Partial" if result.get("partial") else "Complete"
@@ -477,6 +490,9 @@ class FastFileApp:
                 status = "Partial - no scripts" if result.get("partial") else "No scripts found"
             self.tree.set(str(path), "status", status)
             self.tree.set(str(path), "scripts", f"{scripts} / {lua_files}")
+            self.tree.set(str(path), "lua_readable", str(lua_readable) if lua_files else "-")
+            self.tree.set(str(path), "lua_decompiled", str(lua_decompiled) if lua_files else "-")
+            self.tree.set(str(path), "lua_asm", str(lua_asm) if lua_files else "-")
             self.tree.set(str(path), "output", result["output"])
             self.results.append(result)
             self.progress_value.set((index / total) * 100)
@@ -498,6 +514,9 @@ class FastFileApp:
             _, path, error, details, index, total = event
             self.tree.set(str(path), "status", "Error")
             self.tree.set(str(path), "scripts", "-")
+            self.tree.set(str(path), "lua_readable", "-")
+            self.tree.set(str(path), "lua_decompiled", "-")
+            self.tree.set(str(path), "lua_asm", "-")
             self.tree.set(str(path), "output", error)
             self.progress_value.set((index / total) * 100)
             self.status_text.set(f"Error extracting {path.name}: {error}")
@@ -522,6 +541,17 @@ class FastFileApp:
             messagebox.showinfo(APP_NAME, "Select a completed output folder first.")
             return
         os.startfile(path)  # type: ignore[attr-defined]
+
+    def open_selected_subfolder(self, folder_name: str) -> None:
+        path = self.selected_output()
+        if path is None:
+            messagebox.showinfo(APP_NAME, "Select a completed output folder first.")
+            return
+        target = path / folder_name
+        if not target.exists():
+            messagebox.showinfo(APP_NAME, f"{folder_name} was not created for the selected fastfile.")
+            return
+        os.startfile(target)  # type: ignore[attr-defined]
 
     def clear_list(self) -> None:
         if self.worker and self.worker.is_alive():
