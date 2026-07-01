@@ -59,6 +59,8 @@ Use **Open Selected Output** in the app to jump straight to a completed folder.
   - Writes structured Havok/T6 disassembly and pseudo-decompiled listings,
     including observed nested closure bodies.
   - Writes editable bytecode workspace JSON and rebuilds `.lua` bytecode from it.
+  - Writes human-editable Havok assembly (`.hksasm`) and rebuilds `.lua`
+    bytecode from it.
   - Re-emits compiled Lua bytecode losslessly for recompile/repack testing.
   - Editable Lua source recompilation is not complete yet.
 - `ff_dashboard.py`
@@ -225,6 +227,25 @@ python .\lua_tool.py decompile-json-dir path\to\ui_lua -o path\to\ui_lua_edit_js
 python .\lua_tool.py recompile-json-dir path\to\ui_lua_edit_json -o path\to\ui_lua_rebuilt --source-root path\to\ui_lua
 ```
 
+Write editable Havok assembly for one payload:
+
+```powershell
+python .\lua_tool.py decompile-asm path\to\buttonlist.lua -o buttonlist.hksasm
+```
+
+Rebuild bytecode from Havok assembly:
+
+```powershell
+python .\lua_tool.py recompile-asm buttonlist.hksasm -o buttonlist.rebuilt.lua
+```
+
+Batch assembly workflow:
+
+```powershell
+python .\lua_tool.py decompile-asm-dir path\to\ui_lua -o path\to\ui_lua_hksasm
+python .\lua_tool.py recompile-asm-dir path\to\ui_lua_hksasm -o path\to\ui_lua_rebuilt --source-root path\to\ui_lua
+```
+
 Losslessly re-emit compiled bytecode:
 
 ```powershell
@@ -235,5 +256,7 @@ Editable JSON rebuild currently supports same-length string constant edits,
 boolean/number constant edits, decoded instruction edits (`opname`, `a`, `b`,
 `c`, `bx`, `sbx`), and raw 4-byte instruction edits. The compiler patches the
 original byte array by offset and preserves all unknown Havok fields.
+The `.hksasm` workflow exposes the same editable fields in a line-oriented text
+format and embeds compressed workspace metadata at EOF for safe rebuilding.
 Length-changing string edits, adding/removing constants, adding/removing
 instructions, and compiling readable Lua source are not implemented yet.

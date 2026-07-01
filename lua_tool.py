@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import hashlib
 import json
 import math
+import shlex
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -890,6 +892,156 @@ def editable_json_rel_to_lua(rel: Path) -> Path:
     return rel.with_suffix(".lua")
 
 
+def iter_workspace_protos(proto: dict[str, Any], path: str = "0"):
+    yield path, proto
+    for child_index, child in enumerate(proto.get("children", [])):
+        yield from iter_workspace_protos(child, f"{path}.{child_index}")
+
+
+def workspace_proto_by_path(workspace: dict[str, Any], path: str) -> dict[str, Any]:
+    proto = workspace["proto"]
+    if path == "0":
+        return proto
+    parts = path.split(".")
+    if not parts or parts[0] != "0":
+        raise ParseError(f"invalid proto path {path!r}")
+    for part in parts[1:]:
+        try:
+            index = int(part)
+            proto = proto["children"][index]
+        except (ValueError, IndexError, KeyError) as exc:
+            raise ParseError(f"invalid proto path {path!r}") from exc
+    return proto
+
+
+def asm_quote(value: Any) -> str:
+    return shlex.quote(str(value))
+
+
+def hksasm_from_workspace(workspace: dict[str, Any]) -> str:
+    packed_workspace = base64.b64encode(
+        gzip.compress(json.dumps(workspace, separators=(",", ":")).encode("utf-8"))
+    ).decode("ascii")
+    lines = [
+        "; BO2HKSASM v1",
+        "; Human-editable Havok/T6 bytecode assembly.",
+        "; Edit .const value_json/type or .inst opcode/operands/raw fields, then run recompile-asm.",
+        "; A compressed workspace blob at EOF preserves unknown bytes and original payload layout.",
+        "",
+    ]
+    for proto_path, proto in iter_workspace_protos(workspace["proto"]):
+        header = proto.get("header", {})
+        lines.append(
+            f".func path={proto_path} offset=0x{int(proto['offset']):X} "
+            f"maxstack={header.get('max_stack', 0)} instructions={len(proto.get('instructions', []))} "
+            f"constants={len(proto.get('constants', []))}"
+        )
+        for constant in proto.get("constants", []):
+            lines.append(
+                f".const path={proto_path} index={int(constant['index'])} "
+                f"type={constant['type']} value_json={asm_quote(json.dumps(constant.get('value')))}"
+            )
+        for inst in proto.get("instructions", []):
+            lines.append(
+                f".inst path={proto_path} index={int(inst['index'])} op={inst['opname']} "
+                f"a={int(inst['a'])} b={int(inst['b'])} c={int(inst['c'])} "
+                f"bx={int(inst['bx'])} sbx={int(inst['sbx'])} raw={inst['raw_hex']}"
+            )
+        lines.append(".endfunc")
+        lines.append("")
+    lines.extend(
+        [
+            "; Embedded workspace metadata. Keep this line intact for recompilation.",
+            f"; workspace_gzip_b64={packed_workspace}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def parse_key_values(parts: list[str], line_no: int) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for part in parts:
+        if "=" not in part:
+            raise ParseError(f"line {line_no}: expected key=value token, got {part!r}")
+        key, value = part.split("=", 1)
+        values[key] = value
+    return values
+
+
+def workspace_from_hksasm(path: Path) -> dict[str, Any]:
+    workspace: dict[str, Any] | None = None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    marker = "; workspace_gzip_b64="
+    for line_no, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if line.startswith(marker):
+            payload = line[len(marker) :].strip()
+            try:
+                workspace = json.loads(gzip.decompress(base64.b64decode(payload)).decode("utf-8"))
+            except Exception as exc:
+                raise ParseError(f"line {line_no}: embedded workspace is invalid") from exc
+            break
+    if workspace is None:
+        raise ParseError("assembly file is missing ; workspace_gzip_b64 metadata")
+
+    for line_no, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(";"):
+            continue
+
+        parts = shlex.split(line)
+        if not parts:
+            continue
+        directive = parts[0]
+        fields = parse_key_values(parts[1:], line_no)
+        if directive == ".const":
+            proto = workspace_proto_by_path(workspace, fields.get("path", ""))
+            try:
+                index = int(fields["index"])
+                constant = proto["constants"][index]
+            except (KeyError, ValueError, IndexError) as exc:
+                raise ParseError(f"line {line_no}: invalid constant index") from exc
+            if "type" in fields:
+                constant["type"] = fields["type"]
+            if "value_json" in fields:
+                try:
+                    constant["value"] = json.loads(fields["value_json"])
+                except json.JSONDecodeError as exc:
+                    raise ParseError(f"line {line_no}: invalid value_json") from exc
+        elif directive == ".inst":
+            proto = workspace_proto_by_path(workspace, fields.get("path", ""))
+            try:
+                index = int(fields["index"])
+                inst = proto["instructions"][index]
+            except (KeyError, ValueError, IndexError) as exc:
+                raise ParseError(f"line {line_no}: invalid instruction index") from exc
+            if "op" in fields:
+                inst["opname"] = fields["op"]
+            for src, dst in (("opcode", "opcode"), ("a", "a"), ("b", "b"), ("c", "c"), ("bx", "bx"), ("sbx", "sbx")):
+                if src in fields:
+                    inst[dst] = int(fields[src], 0)
+            if "raw" in fields:
+                inst["raw_hex"] = fields["raw"]
+        elif directive in {".func", ".endfunc"}:
+            continue
+        else:
+            raise ParseError(f"line {line_no}: unknown directive {directive!r}")
+    return workspace
+
+
+def rebuild_from_hksasm(path: Path) -> bytes:
+    workspace = workspace_from_hksasm(path)
+    temp_path = path.with_suffix(path.suffix + ".workspace.tmp.json")
+    try:
+        temp_path.write_text(json.dumps(workspace, indent=2) + "\n", encoding="utf-8")
+        return rebuild_from_workspace(temp_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def format_constant(value: Any) -> str:
     if value is None:
         return "nil"
@@ -972,15 +1124,32 @@ def cmd_decompile_json(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decompile_asm(args: argparse.Namespace) -> int:
+    workspace = make_editable_workspace(args.input)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(hksasm_from_workspace(workspace), encoding="utf-8")
+    return 0
+
+
 def cmd_recompile(args: argparse.Namespace) -> int:
-    if args.input.suffix.lower() == ".json":
+    suffix = args.input.suffix.lower()
+    if suffix == ".json":
         data = rebuild_from_workspace(args.input)
+    elif suffix == ".hksasm":
+        data = rebuild_from_hksasm(args.input)
     else:
         # Lossless recompile mode for raw bytecode: copy a compiled chunk back
         # out after validation. Editable source compilation is still a separate
         # milestone; JSON workspace rebuild is handled above.
         data = args.input.read_bytes()
         parse_chunk(args.input)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_bytes(data)
+    return 0
+
+
+def cmd_recompile_asm(args: argparse.Namespace) -> int:
+    data = rebuild_from_hksasm(args.input)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes(data)
     return 0
@@ -1046,6 +1215,40 @@ def cmd_decompile_json_dir(args: argparse.Namespace) -> int:
     return 0 if not failures else 1
 
 
+def cmd_decompile_asm_dir(args: argparse.Namespace) -> int:
+    count = 0
+    skipped = 0
+    failures = []
+    for path in args.input.rglob("*.lua"):
+        if path.read_bytes()[:4] != b"\x1bLua":
+            skipped += 1
+            continue
+        try:
+            workspace = make_editable_workspace(path)
+            text = hksasm_from_workspace(workspace)
+        except Exception as exc:  # noqa: BLE001 - report all files, keep going.
+            failures.append({"path": str(path), "error": str(exc)})
+            continue
+        rel = path.relative_to(args.input)
+        out_path = args.out / rel.with_suffix(".hksasm")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+        count += 1
+    manifest = {
+        "format": "BO2HKSASM v1",
+        "decompiled_asm": count,
+        "skipped_non_bytecode": skipped,
+        "failed": failures,
+        "note": "Edit .const/.inst lines, then rebuild with recompile-asm-dir.",
+    }
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "decompile_asm_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {count} HKS assembly files to {args.out}")
+    if failures:
+        print(f"failed: {len(failures)}")
+    return 0 if not failures else 1
+
+
 def cmd_recompile_dir(args: argparse.Namespace) -> int:
     count = 0
     skipped = 0
@@ -1073,6 +1276,47 @@ def cmd_recompile_dir(args: argparse.Namespace) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "recompile_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"recompiled {count} Lua bytecode files to {args.out}")
+    if failures:
+        print(f"failed: {len(failures)}")
+    return 0 if not failures else 1
+
+
+def hksasm_rel_to_lua(rel: Path) -> Path:
+    return rel.with_suffix(".lua") if rel.suffix.lower() == ".hksasm" else rel
+
+
+def cmd_recompile_asm_dir(args: argparse.Namespace) -> int:
+    count = 0
+    failures = []
+    for path in args.input.rglob("*.hksasm"):
+        try:
+            data = rebuild_from_hksasm(path)
+            workspace = workspace_from_hksasm(path)
+        except Exception as exc:  # noqa: BLE001 - report all files, keep going.
+            failures.append({"path": str(path), "error": str(exc)})
+            continue
+
+        source_path = Path(str(workspace.get("source_path", path.with_suffix(".lua"))))
+        try:
+            rel = source_path.relative_to(args.source_root) if args.source_root else path.relative_to(args.input)
+        except ValueError:
+            rel = hksasm_rel_to_lua(path.relative_to(args.input))
+        if rel.suffix.lower() == ".hksasm":
+            rel = hksasm_rel_to_lua(rel)
+        out_path = args.out / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(data)
+        count += 1
+
+    manifest = {
+        "format": "BO2HKSASM v1",
+        "recompiled_asm": count,
+        "failed": failures,
+        "mode": "HKS assembly rebuild through editable workspace metadata",
+    }
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "recompile_asm_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"rebuilt {count} Lua bytecode files from HKS assembly to {args.out}")
     if failures:
         print(f"failed: {len(failures)}")
     return 0 if not failures else 1
@@ -1135,10 +1379,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_decompile_json)
 
-    p = sub.add_parser("recompile", help="Rebuild from workspace JSON, or losslessly re-emit raw bytecode")
+    p = sub.add_parser("decompile-asm", help="Write human-editable HKS assembly")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.set_defaults(func=cmd_decompile_asm)
+
+    p = sub.add_parser("recompile", help="Rebuild from JSON/HKSASM, or losslessly re-emit raw bytecode")
     p.add_argument("input", type=Path)
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_recompile)
+
+    p = sub.add_parser("recompile-asm", help="Rebuild Lua bytecode from HKS assembly")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.set_defaults(func=cmd_recompile_asm)
 
     p = sub.add_parser("decompile-dir", help="Pseudo-decompile every compiled Lua payload in a folder")
     p.add_argument("input", type=Path)
@@ -1149,6 +1403,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("input", type=Path)
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_decompile_json_dir)
+
+    p = sub.add_parser("decompile-asm-dir", help="Write HKS assembly for every Lua payload")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.set_defaults(func=cmd_decompile_asm_dir)
 
     p = sub.add_parser("recompile-dir", help="Losslessly re-emit every compiled Lua payload in a folder")
     p.add_argument("input", type=Path)
@@ -1164,6 +1423,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Original ui_lua root used to preserve output paths from source_path metadata",
     )
     p.set_defaults(func=cmd_recompile_json_dir)
+
+    p = sub.add_parser("recompile-asm-dir", help="Rebuild Lua bytecode files from HKS assembly")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.add_argument(
+        "--source-root",
+        type=Path,
+        help="Original ui_lua root used to preserve output paths from source_path metadata",
+    )
+    p.set_defaults(func=cmd_recompile_asm_dir)
 
     args = parser.parse_args(argv)
     return args.func(args)

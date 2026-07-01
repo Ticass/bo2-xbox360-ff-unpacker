@@ -105,9 +105,14 @@ Lua bytecode tool status:
 - `lua_tool.py decompile-json` / `decompile-json-dir` write editable bytecode
   workspace JSON files with the original bytecode embedded as base64 plus
   decoded constants/instructions.
+- `lua_tool.py decompile-asm` / `decompile-asm-dir` write human-editable
+  `.hksasm` files. These expose `.const` and `.inst` lines first, with a
+  compressed workspace blob at EOF so unknown bytes can still be preserved.
 - `lua_tool.py recompile` can rebuild from one editable JSON workspace.
 - `lua_tool.py recompile-json-dir` rebuilds a folder of `.edit.json` workspaces
   back into compiled `.lua` payloads.
+- `lua_tool.py recompile-asm` / `recompile-asm-dir` rebuild compiled `.lua`
+  payloads from `.hksasm` files through the same validated workspace patcher.
 - Current editable JSON rebuild support:
   - same-length string constant edits,
   - boolean/number constant edits,
