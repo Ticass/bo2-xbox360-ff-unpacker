@@ -1,9 +1,9 @@
 # Xbox 360 BO2 FastFile Unpacker
 
 This is a Windows-friendly Xbox 360 Black Ops 2 `.ff` unpacker. The focus is
-safe extraction and metadata, especially compiled `.gsc`/`.csc` script payloads.
-The scripts are still compiled/encrypted game payloads; this tool does not
-decompile them yet.
+safe extraction and metadata, especially compiled `.gsc`/`.csc` script payloads
+and compiled Treyarch/Xbox Lua UI payloads. The extracted payloads are still
+compiled/encrypted or bytecode game data; this tool does not decompile them yet.
 
 This repository contains source code only. Built `.exe` files, game fastfiles,
 and extracted outputs are intentionally not committed.
@@ -25,6 +25,9 @@ zombie_blabla\
   metadata.json
   zone_decompressed.dat
   embedded_scripts.json
+  embedded_lua.json
+  scripts\
+  ui_lua\
   assets\
 ```
 
@@ -45,6 +48,7 @@ Use **Open Selected Output** in the app to jump straight to a completed folder.
   - Inflates `TAffx100` XMem/LZX chunks through `_tools/xmem_lzx_decompress.exe`.
   - Inflates `TAff0100` chunks as raw deflate.
   - Extracts high-confidence embedded compiled `.gsc`/`.csc` payloads.
+  - Extracts high-confidence embedded compiled `.lua` UI payloads.
 - `script_inventory.py`
   - Aggregates every `*_ff_scan/embedded_scripts.json`.
   - Writes `script_inventory.tsv`, `script_inventory.json`, and
@@ -125,6 +129,30 @@ The payload starts with `80 47 53 43` in current samples. CSC payloads observed
 so far also use that magic. Extraction confidence is high only when the markers,
 length, script path, bounds, and payload magic all match.
 
+## Current Lua UI extraction rule
+
+Observed compiled Lua UI payloads are recovered by this local layout:
+
+```text
+FFFFFFFF <big-endian payload length> FFFFFFFF <path ending .lua>\0 <Lua bytecode payload>
+```
+
+The payload starts with `1B 4C 75 61` (`\x1bLua`). These files are written to
+`ui_lua\` using their original `.lua` paths, but they are compiled Xbox/Treyarch
+Lua bytecode, not readable Lua source yet.
+
+Confirmed examples:
+
+- `patch_ui_zm.ff`: `47` Lua UI payloads extracted.
+- `patch_ui_mp.ff`: `139` Lua UI payloads extracted.
+
+Examples include:
+
+- `ui/t6/lobby.lua`
+- `ui/t6/buttonlist.lua`
+- `ui/t6/cod9button.lua`
+- `ui_mp/t6/menus/publicgamelobby.lua`
+
 ## Current known limitation
 
 `common_mp.ff` currently scans only as a partial zone. The LZX helper fails on
@@ -140,3 +168,8 @@ For script extraction testing, use script-bearing files such as:
 - `zm_prison_patch.ff`
 - `zm_tomb_patch.ff`
 - `zm_transit_dr_patch.ff`
+
+For Lua UI extraction testing, use:
+
+- `patch_ui_mp.ff`
+- `patch_ui_zm.ff`

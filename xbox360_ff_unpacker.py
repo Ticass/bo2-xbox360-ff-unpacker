@@ -1323,6 +1323,103 @@ def extract_embedded_script_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
     }
 
 
+def extract_embedded_lua_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
+    """Extract embedded compiled Lua UI blobs by local path/header pattern.
+
+    Xbox BO2 LUI assets observed in patch UI zones use the same simple local
+    layout as compiled script blobs:
+
+        FFFFFFFF <be length> FFFFFFFF "<path>.lua\\0" <Lua bytecode>
+
+    The payloads observed so far start with standard-ish Lua bytecode magic
+    `1B 4C 75 61`, followed by Treyarch/Xbox-specific version/format bytes.
+    These are preserved as raw compiled Lua payloads, not decompiled text.
+    """
+
+    lua_dir = out_dir / "assets" / "embedded_lua"
+    friendly_lua_dir = out_dir / "ui_lua"
+    lua_dir.mkdir(parents=True, exist_ok=True)
+    friendly_lua_dir.mkdir(parents=True, exist_ok=True)
+    pattern = rb"[\x20-\x7e]{3,}\.lua"
+    reports: list[dict[str, Any]] = []
+    seen_paths: dict[str, int] = {}
+
+    for match in re.finditer(pattern, data, flags=re.IGNORECASE):
+        path_offset = match.start()
+        header_offset = path_offset - 12
+        if header_offset < 0:
+            continue
+        name_ptr = be_u32(data, header_offset)
+        length = be_u32(data, header_offset + 4)
+        buffer_ptr = be_u32(data, header_offset + 8)
+        if name_ptr != 0xFFFFFFFF or buffer_ptr != 0xFFFFFFFF:
+            continue
+        if length == 0 or length > 16 * 1024 * 1024:
+            continue
+
+        path_end = data.find(b"\x00", path_offset, path_offset + 512)
+        if path_end < 0:
+            continue
+        lua_name = data[path_offset:path_end].decode("ascii", "replace")
+        payload_offset = path_end + 1
+        payload_end = payload_offset + length
+        if payload_end > len(data):
+            continue
+        payload = data[payload_offset:payload_end]
+        if len(payload) < 4 or payload[:4] != b"\x1bLua":
+            continue
+
+        rel = safe_asset_path(lua_name, ".luac")
+        key = str(rel).lower()
+        duplicate_index = seen_paths.get(key, 0)
+        seen_paths[key] = duplicate_index + 1
+        if duplicate_index:
+            rel = rel.with_name(f"{rel.stem}_{path_offset:08x}{rel.suffix}")
+        output_path = lua_dir / rel
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(payload)
+
+        friendly_rel = safe_asset_path(lua_name, ".lua")
+        friendly_output_path = friendly_lua_dir / friendly_rel
+        friendly_output_path.parent.mkdir(parents=True, exist_ok=True)
+        friendly_output_path.write_bytes(payload)
+
+        reports.append(
+            {
+                "lua_name": lua_name,
+                "header_offset": header_offset,
+                "path_offset": path_offset,
+                "payload_offset": payload_offset,
+                "payload_size": length,
+                "payload_magic_hex": payload[:4].hex(),
+                "path": str(output_path),
+                "friendly_path": str(friendly_output_path),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "extraction_confidence": "high",
+                "confidence_reason": "Local following-name/following-buffer header, Lua path, and Lua bytecode magic all match.",
+            }
+        )
+
+    manifest_path = out_dir / "embedded_lua.json"
+    write_json(
+        manifest_path,
+        {
+            "status": "ok",
+            "count": len(reports),
+            "lua_root": str(friendly_lua_dir),
+            "note": "Extracted .lua files are compiled Xbox/Treyarch Lua bytecode payloads, not decompiled Lua source text.",
+            "lua_files": reports,
+        },
+    )
+    return {
+        "status": "ok",
+        "count": len(reports),
+        "manifest_path": str(manifest_path),
+        "lua_root": str(friendly_lua_dir),
+        "lua_sample": reports[:50],
+    }
+
+
 def build_readable_string_inventory(data: bytes, out_dir: Path, min_len: int = 5) -> dict[str, Any]:
     all_path = out_dir / "readable_strings.tsv"
     interesting_path = out_dir / "interesting_strings.tsv"
@@ -1865,6 +1962,7 @@ class FastFileScanner:
                 parser_warnings.append(f"asset stream trace write failed: {exc}")
                 asset_stream_trace = {"status": "failed", "error": str(exc)}
         embedded_scripts = extract_embedded_script_blobs(zone_data, out_dir)
+        embedded_lua = extract_embedded_lua_blobs(zone_data, out_dir)
         if top_level.get("script_strings", {}).get("strings"):
             script_strings_path = out_dir / "script_strings.txt"
             script_strings_path.write_text(
@@ -1911,6 +2009,7 @@ class FastFileScanner:
             "recoverable_prefix_assets": recoverable_prefix_assets,
             "asset_stream_trace": asset_stream_trace,
             "embedded_scripts": embedded_scripts,
+            "embedded_lua": embedded_lua,
             "readable_string_inventory": build_readable_string_inventory(zone_data, out_dir),
             "first_64_bytes": hex_sample(zone_data, 0, 64),
             "chunks": chunk_reports,

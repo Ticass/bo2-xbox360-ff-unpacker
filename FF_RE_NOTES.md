@@ -60,6 +60,39 @@ Test file: `common_zm.ff`
   - `script_inventory_summary.json`
 - Slow menu-specific probing is opt-in with `--scan-menus`; the default path stays focused on broad fastfile unpacking.
 
+## Embedded Lua UI extraction
+
+Xbox BO2 UI/LUI payloads in patch UI fastfiles use the same local blob layout as
+embedded script payloads:
+
+| Relative layout | Meaning |
+| --- | --- |
+| `FFFFFFFF` | following-name pointer marker |
+| big-endian `uint32` | compiled Lua payload length |
+| `FFFFFFFF` | following-buffer pointer marker |
+| ASCII path ending in `.lua` plus `00` | Lua UI path/name |
+| payload bytes | compiled Lua bytecode payload |
+
+The payloads observed so far start with `1B 4C 75 61` (`\x1bLua`) followed by
+Treyarch/Xbox-specific Lua bytecode header bytes. The extractor writes:
+
+- `embedded_lua.json`
+- `assets/embedded_lua/<original lua path>`
+- `ui_lua/<original lua path>`
+
+Verified counts:
+
+- `patch_ui_zm.ff`: `47` compiled Lua UI payloads extracted.
+- `patch_ui_mp.ff`: `139` compiled Lua UI payloads extracted.
+
+Example extracted paths:
+
+- `patch_ui_zm/ui_lua/ui/t6/lobby.lua`
+- `patch_ui_zm/ui_lua/ui_mp/t6/zombie/basezombie.lua`
+- `patch_ui_mp/ui_lua/ui/t6/buttonlist.lua`
+- `patch_ui_mp/ui_lua/ui/t6/cod9button.lua`
+- `patch_ui_mp/ui_lua/ui_mp/t6/menus/publicgamelobby.lua`
+
 ## Embedded GSC/CSC extraction
 
 Observed Xbox compiled script blobs can be recovered by a local self-describing

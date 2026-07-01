@@ -59,6 +59,7 @@ def scan_dirs() -> list[dict]:
         seen.add(scan_dir.resolve())
         metadata = read_json(scan_dir / "metadata.json", {})
         embedded = read_json(scan_dir / "embedded_scripts.json", {})
+        embedded_lua = read_json(scan_dir / "embedded_lua.json", {})
         dz = metadata.get("decompressed_zone", {}) if isinstance(metadata, dict) else {}
         rows.append(
             {
@@ -66,6 +67,7 @@ def scan_dirs() -> list[dict]:
                 "path": str(scan_dir),
                 "source_fastfile": metadata.get("input", {}).get("path", ""),
                 "scripts": int(embedded.get("count") or 0),
+                "lua_files": int(embedded_lua.get("count") or 0),
                 "status": dz.get("top_level_zone", {}).get("status", "unknown"),
                 "partial_zone": bool(dz.get("partial_zone")),
                 "chunk_errors": dz.get("chunk_errors", []),
@@ -93,6 +95,22 @@ def collected_scripts() -> list[dict]:
                     "sha256": str(script.get("sha256") or ""),
                     "path": str(script.get("path") or ""),
                     "extraction_confidence": str(script.get("extraction_confidence") or ""),
+                }
+            )
+        lua_manifest = read_json(scan_dir / "embedded_lua.json", {})
+        for lua_file in lua_manifest.get("lua_files", []):
+            lua_name = str(lua_file.get("lua_name") or "")
+            rows.append(
+                {
+                    "scan": scan_dir.name,
+                    "source_fastfile": scan.get("source_fastfile", ""),
+                    "script_name": lua_name,
+                    "kind": "lua",
+                    "payload_size": int(lua_file.get("payload_size") or 0),
+                    "payload_magic_hex": str(lua_file.get("payload_magic_hex") or ""),
+                    "sha256": str(lua_file.get("sha256") or ""),
+                    "path": str(lua_file.get("friendly_path") or lua_file.get("path") or ""),
+                    "extraction_confidence": str(lua_file.get("extraction_confidence") or ""),
                 }
             )
     return rows
@@ -236,7 +254,7 @@ INDEX_HTML = r"""<!doctype html>
     main { padding: 20px 24px 32px; }
     .stats {
       display: grid;
-      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
       gap: 10px;
       margin-bottom: 18px;
     }
@@ -340,7 +358,7 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>BO2 Xbox 360 Fastfile Unpacker</h1>
+      <h1>BO2 Xbox 360 Fastfile Unpacker</h1>
     <button id="refresh">Refresh</button>
   </header>
   <main>
@@ -358,9 +376,10 @@ INDEX_HTML = r"""<!doctype html>
     <section class="toolbar">
       <input id="query" placeholder="Filter scripts by name, hash, or fastfile">
       <select id="kind">
-        <option value="">All script types</option>
+        <option value="">All payload types</option>
         <option value="gsc">GSC</option>
         <option value="csc">CSC</option>
+        <option value="lua">Lua UI</option>
       </select>
       <select id="scanSelect"></select>
       <button id="scanBtn">Scan Selected</button>
@@ -371,7 +390,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="scroll"><table id="scans"></table></div>
       </div>
       <div class="panel">
-        <h2>Extracted Scripts</h2>
+        <h2>Extracted Payloads</h2>
         <div class="scroll"><table id="scripts"></table></div>
       </div>
     </section>
@@ -407,6 +426,7 @@ INDEX_HTML = r"""<!doctype html>
         ["Unique Hashes", s.unique_payload_hashes],
         ["GSC", s.by_kind?.gsc || 0],
         ["CSC", s.by_kind?.csc || 0],
+        ["Lua", s.by_kind?.lua || 0],
       ].map(([label, value]) => `<div class="stat"><b>${esc(value || 0)}</b><span>${esc(label)}</span></div>`).join("");
     }
     function renderScans() {
@@ -414,7 +434,7 @@ INDEX_HTML = r"""<!doctype html>
         state.scans.map(row => {
           const cls = row.partial_zone || row.chunk_errors?.length ? "warn" : "ok";
           const status = row.partial_zone ? "partial" : (row.status || "ok");
-          return `<tr><td><code>${esc(row.name)}</code><br><span class="muted">${esc(row.source_fastfile)}</span></td><td>${esc(row.scripts)}</td><td><span class="${cls}">${esc(status)}</span></td></tr>`;
+          return `<tr><td><code>${esc(row.name)}</code><br><span class="muted">${esc(row.source_fastfile)}</span></td><td>${esc(row.scripts)} / ${esc(row.lua_files || 0)}</td><td><span class="${cls}">${esc(status)}</span></td></tr>`;
         }).join("") + `</tbody>`;
     }
     function renderFastfileSelect() {
@@ -431,7 +451,7 @@ INDEX_HTML = r"""<!doctype html>
         const blob = `${row.script_name} ${row.scan} ${row.source_fastfile} ${row.sha256}`.toLowerCase();
         return !q || blob.includes(q);
       }).slice(0, 1000);
-      $("scripts").innerHTML = `<thead><tr><th>Script</th><th>Source</th><th>Size</th><th>Hash</th></tr></thead><tbody>` +
+      $("scripts").innerHTML = `<thead><tr><th>Payload</th><th>Source</th><th>Size</th><th>Hash</th></tr></thead><tbody>` +
         rows.map(row => `<tr><td><code>${esc(row.script_name)}</code><br><span class="pill">${esc(row.kind)}</span></td><td>${esc(row.scan)}<br><span class="muted">${esc(row.source_fastfile)}</span></td><td>${size(row.payload_size)}</td><td><code>${esc(String(row.sha256).slice(0, 16))}</code></td></tr>`).join("") +
         `</tbody>`;
     }

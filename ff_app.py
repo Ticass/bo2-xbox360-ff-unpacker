@@ -80,22 +80,32 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
     )
     write_json(metadata_path, metadata)
 
-    scripts = metadata.get("decompressed_zone", {}).get("embedded_scripts", {}).get("count", 0)
-    partial = metadata.get("decompressed_zone", {}).get("partial_zone", False)
-    chunk_errors = metadata.get("decompressed_zone", {}).get("chunk_errors", [])
+    decompressed_zone = metadata.get("decompressed_zone", {})
+    scripts = decompressed_zone.get("embedded_scripts", {}).get("count", 0)
+    lua_files = decompressed_zone.get("embedded_lua", {}).get("count", 0)
+    partial = decompressed_zone.get("partial_zone", False)
+    chunk_errors = decompressed_zone.get("chunk_errors", [])
     result_readme = out_dir / "README_EXTRACT_RESULT.txt"
-    if scripts:
+    if scripts or lua_files:
+        found_lines = [
+            f"Compiled GSC/CSC script payloads extracted: {scripts}",
+            f"Compiled Lua UI payloads extracted: {lua_files}",
+        ]
+        folder_lines = []
+        if scripts:
+            folder_lines.extend(["Open the scripts folder for extracted .gsc/.csc payloads:", str(out_dir / "scripts"), ""])
+        if lua_files:
+            folder_lines.extend(["Open the ui_lua folder for extracted .lua bytecode payloads:", str(out_dir / "ui_lua"), ""])
         result_readme.write_text(
             "\n".join(
                 [
                     f"FastFile: {path}",
                     f"Status: {'partial scan' if partial else 'complete scan'}",
-                    f"Compiled script payloads extracted: {scripts}",
                     "",
-                    "Open the scripts folder for the extracted .gsc/.csc payloads:",
-                    str(out_dir / "scripts"),
+                    *found_lines,
                     "",
-                    "Important: these .gsc/.csc files are compiled Xbox bytecode payloads, not decompiled source text yet.",
+                    *folder_lines,
+                    "Important: extracted .gsc/.csc/.lua files are compiled Xbox/Treyarch bytecode payloads, not decompiled source text yet.",
                     "",
                 ]
             ),
@@ -114,10 +124,12 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
                     f"FastFile: {path}",
                     f"Status: {'partial scan' if partial else 'complete scan'}",
                     "Compiled script payloads extracted: 0",
+                    "Compiled Lua UI payloads extracted: 0",
                     "",
                     reason,
                     "",
                     "Try script-bearing files such as patch_mp.ff, patch_zm.ff, or map patch FastFiles.",
+                    "Try UI Lua-bearing files such as patch_ui_zm.ff or patch_ui_mp.ff.",
                     "Technical metadata is in metadata.json.",
                     "",
                 ]
@@ -129,6 +141,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
         "output": str(out_dir),
         "metadata": str(metadata_path),
         "scripts": scripts,
+        "lua_files": lua_files,
         "partial": partial,
         "readme": str(result_readme),
     }
@@ -290,7 +303,7 @@ class FastFileApp:
         table_frame.pack(fill=BOTH, expand=True, pady=(16, 10))
         self.tree = ttk.Treeview(table_frame, columns=("status", "scripts", "output"), show="headings")
         self.tree.heading("status", text="Status")
-        self.tree.heading("scripts", text="Scripts")
+        self.tree.heading("scripts", text="GSC/CSC / Lua")
         self.tree.heading("output", text="Output")
         self.tree.column("status", width=150, anchor="w")
         self.tree.column("scripts", width=90, anchor="center")
@@ -416,19 +429,24 @@ class FastFileApp:
         elif kind == "done":
             _, path, result, index, total = event
             scripts = result.get("scripts", 0)
+            lua_files = result.get("lua_files", 0)
             if scripts:
                 status = "Partial" if result.get("partial") else "Complete"
+            elif lua_files:
+                status = "Partial - Lua only" if result.get("partial") else "Lua extracted"
             else:
                 status = "Partial - no scripts" if result.get("partial") else "No scripts found"
             self.tree.set(str(path), "status", status)
-            self.tree.set(str(path), "scripts", str(scripts))
+            self.tree.set(str(path), "scripts", f"{scripts} / {lua_files}")
             self.tree.set(str(path), "output", result["output"])
             self.results.append(result)
             self.progress_value.set((index / total) * 100)
             if scripts:
-                self.status_text.set(f"Finished {path.name}. Extracted {scripts} script payload(s).")
+                self.status_text.set(f"Finished {path.name}. Extracted {scripts} script and {lua_files} Lua payload(s).")
+            elif lua_files:
+                self.status_text.set(f"Finished {path.name}. Extracted {lua_files} Lua UI payload(s).")
             else:
-                self.status_text.set(f"Finished {path.name}. No GSC/CSC payloads were found.")
+                self.status_text.set(f"Finished {path.name}. No GSC/CSC or Lua payloads were found.")
         elif kind == "error":
             _, path, error, details, index, total = event
             self.tree.set(str(path), "status", "Error")
