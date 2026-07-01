@@ -1,0 +1,9 @@
+This project is distributed under the GNU General Public License, version 2
+or later, because the bundled LZX decompression source in tools/lzx.c and
+tools/lzx.h is GPL-licensed.
+
+See: https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+The Xbox 360 Black Ops 2 fastfile research code in this repository is provided
+for interoperability/research purposes. No game content, extracted fastfiles,
+or built executables are included in the source repository.

@@ -1,0 +1,42 @@
+# Build/package outputs
+/build/
+/dist/
+*.spec.bak
+
+# Local generated helper binary
+/_tools/
+
+# Extracted fastfile outputs and scan workspaces
+/*_ff_scan/
+/code_post_gfx_1080_mp_ff_scan/
+/common_mp_ff_scan/
+/common_patch_mp_ff_scan/
+/common_zm_ff_scan/
+/dev_zm_ff_scan/
+/patch_mp_ff_scan/
+/patch_ui_zm_ff_scan/
+/patch_zm_ff_scan/
+/ui_zm_ff_scan/
+/zm_*_ff_scan/
+
+# Generated inventories and logs
+/script_inventory.json
+/script_inventory.tsv
+/script_inventory_summary.json
+/*.log
+/*_stdout.txt
+/*_stderr.txt
+/*.7z
+
+# Python/editor noise
+/__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+
+# Game files and extraction outputs should never live in this repo
+*.ff
+*.zone
+*.xpak
+*.iwd
