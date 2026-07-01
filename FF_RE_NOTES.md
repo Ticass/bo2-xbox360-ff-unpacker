@@ -102,9 +102,21 @@ Lua bytecode tool status:
   instruction word for field extraction.
 - Root closure counts are inferred from `CLOSURE` operands, not from the first
   post-constant footer value.
-- `lua_tool.py recompile` and `recompile-dir` currently perform lossless
-  bytecode re-emission. This is useful for repack testing but is not editable
-  source compilation yet.
+- `lua_tool.py decompile-json` / `decompile-json-dir` write editable bytecode
+  workspace JSON files with the original bytecode embedded as base64 plus
+  decoded constants/instructions.
+- `lua_tool.py recompile` can rebuild from one editable JSON workspace.
+- `lua_tool.py recompile-json-dir` rebuilds a folder of `.edit.json` workspaces
+  back into compiled `.lua` payloads.
+- Current editable JSON rebuild support:
+  - same-length string constant edits,
+  - boolean/number constant edits,
+  - raw 4-byte instruction edits through `raw_hex`.
+- The JSON compiler patches the original byte array by absolute offsets and
+  validates the rebuilt payload by reparsing it. This preserves unknown Havok
+  descriptor/footer bytes exactly.
+- `lua_tool.py recompile` and `recompile-dir` also perform lossless bytecode
+  re-emission for raw bytecode inputs.
 - Root prototype header observed so far:
   - source string
   - little-endian line-defined / last-line-defined fields
@@ -123,8 +135,8 @@ Lua bytecode tool status:
   - code starts at `align4(descriptor_start + 0x19)`.
   - constants use the same observed big-endian string-length layout.
 - Full opcode semantics, high-level control flow recovery, local/upvalue naming,
-  and editable source recompilation are still required before true readable Lua
-  source round-tripping.
+  length-changing rewrites, and readable Lua source compilation are still
+  required before true source-level Lua round-tripping.
 
 ## Embedded GSC/CSC extraction
 

@@ -6,16 +6,20 @@ This is not a full source decompiler yet. It provides the foundation we need:
 - parse the observed Treyarch Lua header/type table
 - parse function prototypes, instructions, constants, and nested prototypes
 - emit a readable disassembly/pseudo listing
-- recompile by copying bytecode chunks losslessly, with optional manifest checks
+- emit editable bytecode workspace JSON
+- rebuild bytecode from workspace JSON while preserving unknown bytes
+- recompile raw bytecode chunks losslessly, with optional manifest checks
 
-The bytecode is compiled Lua 5.1-ish data with Treyarch/Xbox additions. Until
-the opcode map and control-flow rules are fully proven, "decompile" here means
-structured disassembly plus constant/function inventory, not editable Lua source.
+The bytecode is HavokScript/Treyarch T6 Lua data with Xbox-specific byte order
+and wrapper fields. Until the opcode semantics and control-flow rules are fully
+proven, "decompile" here means structural disassembly plus an editable bytecode
+workspace, not readable Lua source.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
@@ -271,6 +275,54 @@ def parse_constant(data: bytes, offset: int, index: int) -> tuple[Constant, int]
     else:
         raise ParseError(f"unsupported constant tag {tag} at 0x{start:X}")
     return Constant(index, tag, TYPE_NAMES.get(tag, f"type_{tag}"), value, start, offset), offset
+
+
+def encode_constant_for_patch(constant: Constant, edited: dict[str, Any]) -> bytes:
+    """Encode a constant without changing its serialized size.
+
+    This is the first safe recompilation step: users can edit values that fit in
+    the existing slot, and the tool refuses anything that would shift later
+    unknown Havok data.
+    """
+
+    type_name = edited.get("type", constant.type_name)
+    if type_name != constant.type_name:
+        raise ParseError(
+            f"K[{constant.index}] type changes are not supported yet "
+            f"({constant.type_name!r} -> {type_name!r})"
+        )
+
+    if constant.type_tag == 0:
+        if edited.get("value") is not None:
+            raise ParseError(f"K[{constant.index}] nil constant cannot hold a non-nil value")
+        return b"\x00"
+
+    if constant.type_tag == 1:
+        value = edited.get("value")
+        if not isinstance(value, bool):
+            raise ParseError(f"K[{constant.index}] boolean value must be true or false")
+        return b"\x01" + (b"\x01" if value else b"\x00")
+
+    if constant.type_tag == 3:
+        try:
+            number = float(edited.get("value"))
+        except (TypeError, ValueError) as exc:
+            raise ParseError(f"K[{constant.index}] number value is invalid") from exc
+        return b"\x03" + struct.pack(">f", number)
+
+    if constant.type_tag == 4:
+        original_size = constant.end_offset - constant.offset
+        original_payload_len = original_size - 1 - 4
+        value = str(edited.get("value", ""))
+        raw = value.encode("utf-8")
+        if len(raw) + 1 != original_payload_len:
+            raise ParseError(
+                f"K[{constant.index}] string edit changes serialized length "
+                f"({len(raw) + 1} != {original_payload_len}); same-length edits only for now"
+            )
+        return b"\x04" + original_payload_len.to_bytes(4, "big") + raw + b"\x00"
+
+    raise ParseError(f"K[{constant.index}] unsupported constant tag {constant.type_tag}")
 
 
 def parse_type_table(data: bytes) -> tuple[dict[str, Any], int]:
@@ -567,6 +619,52 @@ def proto_to_dict(proto: Proto) -> dict[str, Any]:
     }
 
 
+def proto_to_editable(proto: Proto) -> dict[str, Any]:
+    return {
+        "index": proto.index,
+        "offset": proto.offset,
+        "end_offset": proto.end_offset,
+        "header": {
+            "source": proto.source,
+            "line_defined": proto.line_defined,
+            "last_line_defined": proto.last_line_defined,
+            "upvalue_count": proto.upvalue_count,
+            "param_count": proto.param_count,
+            "proto_flags": proto.proto_flags,
+            "instruction_count": proto.instruction_count,
+            "max_stack": proto.max_stack,
+        },
+        "constants": [
+            {
+                "index": c.index,
+                "offset": c.offset,
+                "end_offset": c.end_offset,
+                "type": c.type_name,
+                "value": c.value,
+                "note": "same serialized length required for string edits",
+            }
+            for c in proto.constants
+        ],
+        "instructions": [
+            {
+                "index": inst.index,
+                "offset": inst.offset,
+                "raw_hex": inst.raw.hex(),
+                "opname": inst.opname,
+                "a": inst.a,
+                "b": inst.b,
+                "c": inst.c,
+                "bx": inst.bx,
+                "sbx": inst.sbx,
+                "note": "edit raw_hex only; opcode fields are informational in this format",
+            }
+            for inst in proto.instructions
+        ],
+        "children": [proto_to_editable(child) for child in proto.children],
+        "debug": proto.debug,
+    }
+
+
 def parse_chunk(path: Path) -> dict[str, Any]:
     data = path.read_bytes()
     header, offset = parse_type_table(data)
@@ -581,6 +679,115 @@ def parse_chunk(path: Path) -> dict[str, Any]:
         "end_offset": end,
         "trailing_bytes": len(data) - end,
     }
+
+
+def make_editable_workspace(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    parsed = parse_chunk(path)
+    return {
+        "format": "bo2-xbox-lua-edit-v1",
+        "source_path": str(path),
+        "original_sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "mode": (
+            "editable bytecode workspace; supports same-length constant edits and raw "
+            "instruction-byte edits while preserving all unknown bytes"
+        ),
+        "original_bytes_b64": base64.b64encode(data).decode("ascii"),
+        "header": parsed["header"],
+        "proto_start": parsed["proto_start"],
+        "proto": proto_to_editable(parsed["proto"]),
+    }
+
+
+def apply_editable_proto(data: bytearray, current: Proto, edited: dict[str, Any]) -> None:
+    if int(edited.get("offset", -1)) != current.offset:
+        raise ParseError(
+            f"proto offset mismatch: parsed 0x{current.offset:X}, JSON has 0x{int(edited.get('offset', -1)):X}"
+        )
+
+    edited_instructions = edited.get("instructions", [])
+    if len(edited_instructions) != len(current.instructions):
+        raise ParseError(
+            f"proto 0x{current.offset:X} instruction count changed "
+            f"({len(edited_instructions)} != {len(current.instructions)})"
+        )
+    for inst, edited_inst in zip(current.instructions, edited_instructions):
+        if int(edited_inst.get("offset", -1)) != inst.offset:
+            raise ParseError(f"instruction offset mismatch at proto 0x{current.offset:X}, index {inst.index}")
+        raw_hex = str(edited_inst.get("raw_hex", inst.raw.hex())).replace(" ", "")
+        try:
+            raw = bytes.fromhex(raw_hex)
+        except ValueError as exc:
+            raise ParseError(f"instruction {inst.index} raw_hex is invalid") from exc
+        if len(raw) != 4:
+            raise ParseError(f"instruction {inst.index} raw_hex must encode exactly 4 bytes")
+        data[inst.offset : inst.offset + 4] = raw
+
+    edited_constants = edited.get("constants", [])
+    if len(edited_constants) != len(current.constants):
+        raise ParseError(
+            f"proto 0x{current.offset:X} constant count changed "
+            f"({len(edited_constants)} != {len(current.constants)})"
+        )
+    for constant, edited_constant in zip(current.constants, edited_constants):
+        if int(edited_constant.get("offset", -1)) != constant.offset:
+            raise ParseError(f"constant offset mismatch at proto 0x{current.offset:X}, index {constant.index}")
+        encoded = encode_constant_for_patch(constant, edited_constant)
+        expected_len = constant.end_offset - constant.offset
+        if len(encoded) != expected_len:
+            raise ParseError(
+                f"K[{constant.index}] encoded length mismatch ({len(encoded)} != {expected_len})"
+            )
+        data[constant.offset : constant.end_offset] = encoded
+
+    edited_children = edited.get("children", [])
+    if len(edited_children) != len(current.children):
+        raise ParseError(
+            f"proto 0x{current.offset:X} child count changed "
+            f"({len(edited_children)} != {len(current.children)})"
+        )
+    for child, edited_child in zip(current.children, edited_children):
+        apply_editable_proto(data, child, edited_child)
+
+
+def rebuild_from_workspace(workspace_path: Path) -> bytes:
+    workspace = json.loads(workspace_path.read_text(encoding="utf-8"))
+    if workspace.get("format") != "bo2-xbox-lua-edit-v1":
+        raise ParseError("unsupported workspace format; expected bo2-xbox-lua-edit-v1")
+    try:
+        data = bytearray(base64.b64decode(workspace["original_bytes_b64"], validate=True))
+    except Exception as exc:
+        raise ParseError("workspace original_bytes_b64 is invalid") from exc
+
+    expected_size = int(workspace.get("size", -1))
+    if len(data) != expected_size:
+        raise ParseError(f"workspace byte size mismatch ({len(data)} != {expected_size})")
+
+    expected_hash = str(workspace.get("original_sha256", "")).lower()
+    actual_hash = hashlib.sha256(data).hexdigest()
+    if expected_hash and expected_hash != actual_hash:
+        raise ParseError(f"workspace original byte hash mismatch ({actual_hash} != {expected_hash})")
+
+    # Parse the embedded original bytes, not a sidecar file path, so the JSON is
+    # self-contained and safe to share.
+    header, offset = parse_type_table(bytes(data))
+    current_proto, _end = parse_proto(bytes(data), offset)
+    apply_editable_proto(data, current_proto, workspace["proto"])
+
+    # Reparse after patching to make sure edits did not create malformed bytecode.
+    header2, offset2 = parse_type_table(bytes(data))
+    reparsed_proto, _end2 = parse_proto(bytes(data), offset2)
+    if header2.get("type_count") != header.get("type_count") or reparsed_proto.offset != current_proto.offset:
+        raise ParseError("rebuilt bytecode failed structural validation")
+    return bytes(data)
+
+
+def editable_json_rel_to_lua(rel: Path) -> Path:
+    text = rel.as_posix()
+    if text.endswith(".edit.json"):
+        return Path(text[: -len(".edit.json")] + ".lua")
+    return rel.with_suffix(".lua")
 
 
 def format_constant(value: Any) -> str:
@@ -658,12 +865,22 @@ def cmd_decompile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decompile_json(args: argparse.Namespace) -> int:
+    workspace = make_editable_workspace(args.input)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(workspace, indent=2) + "\n", encoding="utf-8")
+    return 0
+
+
 def cmd_recompile(args: argparse.Namespace) -> int:
-    # Lossless recompile mode for now: copy a compiled bytecode chunk back out.
-    # This gives us a stable repack target before editable source compilation is
-    # implemented.
-    data = args.input.read_bytes()
-    parse_chunk(args.input)
+    if args.input.suffix.lower() == ".json":
+        data = rebuild_from_workspace(args.input)
+    else:
+        # Lossless recompile mode for raw bytecode: copy a compiled chunk back
+        # out after validation. Editable source compilation is still a separate
+        # milestone; JSON workspace rebuild is handled above.
+        data = args.input.read_bytes()
+        parse_chunk(args.input)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes(data)
     return 0
@@ -691,6 +908,39 @@ def cmd_decompile_dir(args: argparse.Namespace) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "decompile_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"decompiled {count} Lua bytecode files to {args.out}")
+    if failures:
+        print(f"failed: {len(failures)}")
+    return 0 if not failures else 1
+
+
+def cmd_decompile_json_dir(args: argparse.Namespace) -> int:
+    count = 0
+    skipped = 0
+    failures = []
+    for path in args.input.rglob("*.lua"):
+        if path.read_bytes()[:4] != b"\x1bLua":
+            skipped += 1
+            continue
+        try:
+            workspace = make_editable_workspace(path)
+        except Exception as exc:  # noqa: BLE001 - report all files, keep going.
+            failures.append({"path": str(path), "error": str(exc)})
+            continue
+        rel = path.relative_to(args.input)
+        out_path = args.out / rel.with_suffix(".edit.json")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(workspace, indent=2) + "\n", encoding="utf-8")
+        count += 1
+    manifest = {
+        "format": "bo2-xbox-lua-edit-v1",
+        "decompiled_json": count,
+        "skipped_non_bytecode": skipped,
+        "failed": failures,
+        "note": "Edit same-length constants or instruction raw_hex, then rebuild with recompile-json-dir.",
+    }
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "decompile_json_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {count} editable Lua bytecode JSON files to {args.out}")
     if failures:
         print(f"failed: {len(failures)}")
     return 0 if not failures else 1
@@ -728,6 +978,43 @@ def cmd_recompile_dir(args: argparse.Namespace) -> int:
     return 0 if not failures else 1
 
 
+def cmd_recompile_json_dir(args: argparse.Namespace) -> int:
+    count = 0
+    failures = []
+    for path in args.input.rglob("*.edit.json"):
+        try:
+            data = rebuild_from_workspace(path)
+            workspace = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - report all files, keep going.
+            failures.append({"path": str(path), "error": str(exc)})
+            continue
+
+        source_path = Path(str(workspace.get("source_path", path.with_suffix(".lua"))))
+        try:
+            rel = source_path.relative_to(args.source_root) if args.source_root else path.relative_to(args.input)
+        except ValueError:
+            rel = editable_json_rel_to_lua(path.relative_to(args.input))
+        if rel.suffix.lower() == ".json":
+            rel = editable_json_rel_to_lua(rel)
+        out_path = args.out / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(data)
+        count += 1
+
+    manifest = {
+        "format": "bo2-xbox-lua-edit-v1",
+        "recompiled_json": count,
+        "failed": failures,
+        "mode": "workspace JSON rebuild; supports same-length constants and raw instruction-byte edits",
+    }
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "recompile_json_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"rebuilt {count} Lua bytecode files from editable JSON to {args.out}")
+    if failures:
+        print(f"failed: {len(failures)}")
+    return 0 if not failures else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -743,7 +1030,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_decompile)
 
-    p = sub.add_parser("recompile", help="Losslessly re-emit a compiled BO2 Lua payload")
+    p = sub.add_parser("decompile-json", help="Write an editable bytecode workspace JSON")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.set_defaults(func=cmd_decompile_json)
+
+    p = sub.add_parser("recompile", help="Rebuild from workspace JSON, or losslessly re-emit raw bytecode")
     p.add_argument("input", type=Path)
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_recompile)
@@ -753,10 +1045,25 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_decompile_dir)
 
+    p = sub.add_parser("decompile-json-dir", help="Write editable bytecode workspace JSON for every Lua payload")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.set_defaults(func=cmd_decompile_json_dir)
+
     p = sub.add_parser("recompile-dir", help="Losslessly re-emit every compiled Lua payload in a folder")
     p.add_argument("input", type=Path)
     p.add_argument("-o", "--out", type=Path, required=True)
     p.set_defaults(func=cmd_recompile_dir)
+
+    p = sub.add_parser("recompile-json-dir", help="Rebuild Lua bytecode files from editable workspace JSON")
+    p.add_argument("input", type=Path)
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.add_argument(
+        "--source-root",
+        type=Path,
+        help="Original ui_lua root used to preserve output paths from source_path metadata",
+    )
+    p.set_defaults(func=cmd_recompile_json_dir)
 
     args = parser.parse_args(argv)
     return args.func(args)

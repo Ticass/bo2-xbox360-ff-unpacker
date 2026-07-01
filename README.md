@@ -58,6 +58,7 @@ Use **Open Selected Output** in the app to jump straight to a completed folder.
   - Parses BO2 Xbox/Treyarch Lua UI bytecode.
   - Writes structured Havok/T6 disassembly and pseudo-decompiled listings,
     including observed nested closure bodies.
+  - Writes editable bytecode workspace JSON and rebuilds `.lua` bytecode from it.
   - Re-emits compiled Lua bytecode losslessly for recompile/repack testing.
   - Editable Lua source recompilation is not complete yet.
 - `ff_dashboard.py`
@@ -205,13 +206,33 @@ Pseudo-decompile a folder:
 python .\lua_tool.py decompile-dir path\to\ui_lua -o path\to\ui_lua_decompiled
 ```
 
+Write editable bytecode JSON for one payload:
+
+```powershell
+python .\lua_tool.py decompile-json path\to\buttonlist.lua -o buttonlist.edit.json
+```
+
+Rebuild bytecode from editable JSON:
+
+```powershell
+python .\lua_tool.py recompile buttonlist.edit.json -o buttonlist.rebuilt.lua
+```
+
+Batch editable JSON workflow:
+
+```powershell
+python .\lua_tool.py decompile-json-dir path\to\ui_lua -o path\to\ui_lua_edit_json
+python .\lua_tool.py recompile-json-dir path\to\ui_lua_edit_json -o path\to\ui_lua_rebuilt --source-root path\to\ui_lua
+```
+
 Losslessly re-emit compiled bytecode:
 
 ```powershell
 python .\lua_tool.py recompile path\to\buttonlist.lua -o buttonlist.recompiled.lua
 ```
 
-Lossless recompile currently means byte-for-byte re-emission of existing BO2 Lua
-bytecode after validating that the input is parseable. Compiling edited readable
-Lua source back into Treyarch/Havok bytecode still requires a real compiler or
-assembler for this Xbox format.
+Editable JSON rebuild currently supports same-length string constant edits,
+boolean/number constant edits, and raw 4-byte instruction edits. The compiler
+patches the original byte array by offset and preserves all unknown Havok fields.
+Length-changing string edits, adding/removing constants, adding/removing
+instructions, and compiling readable Lua source are not implemented yet.
