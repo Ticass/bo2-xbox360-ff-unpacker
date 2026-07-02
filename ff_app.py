@@ -17,7 +17,12 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, filedialog, messagebox, ttk
 import tkinter as tk
 
 from lua_tool import cmd_decompile_asm_dir, cmd_decompile_dir, cmd_decompile_source_dir
-from xbox360_ff_unpacker import FastFileScanner, write_json
+from xbox360_ff_unpacker import (
+    FastFileScanner,
+    repack_fastfile_from_folder,
+    repack_fastfile_from_zip,
+    write_json,
+)
 
 
 APP_NAME = "BO2 Xbox 360 FastFile Unpacker"
@@ -276,7 +281,7 @@ class FastFileApp:
         # message subclassing or an extra native extension; keep the subclass
         # disabled until it is fully proven to avoid unclosable flashing windows.
         if ENABLE_EXPERIMENTAL_WINDOW_DROP:
-            self.drop_target = WindowsDropTarget(root, self.add_files)
+            self.drop_target = WindowsDropTarget(root, self.on_drop)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll_worker()
 
@@ -321,17 +326,21 @@ class FastFileApp:
 
         drop = ttk.Frame(outer, style="Panel.TFrame", padding=28)
         drop.pack(fill=X)
-        ttk.Label(drop, text="Choose .ff files or drag them onto the executable", style="Drop.TLabel").pack(anchor="center")
+        ttk.Label(drop, text="Drag .ff files here to unpack, or folder .zip files to repack", style="Drop.TLabel").pack(anchor="center")
         ttk.Label(
             drop,
-            text="Extraction starts automatically. Each output folder is created beside its source file.",
+            text="Unpack: each .ff extracts to a folder beside it (GSC/CSC, .menu, and auto-decompiled Lua). "
+            "Repack: a folder .zip (e.g. common_zm.zip) rebuilds common_zm.ff beside the zip.",
             background="#181b21",
             foreground="#aeb6c2",
+            wraplength=760,
+            justify="center",
         ).pack(anchor="center", pady=(6, 16))
         actions = ttk.Frame(drop, style="Panel.TFrame")
         actions.pack(anchor="center")
-        ttk.Button(actions, text="Choose .ff Files", style="Accent.TButton", command=self.choose_files).pack(side=LEFT, padx=4)
+        ttk.Button(actions, text="Unpack .ff Files", style="Accent.TButton", command=self.choose_files).pack(side=LEFT, padx=4)
         ttk.Button(actions, text="Extract All From Game Folder", command=self.extract_all_from_game_folder).pack(side=LEFT, padx=4)
+        ttk.Button(actions, text="Repack .zip -> .ff", command=self.choose_zip).pack(side=LEFT, padx=4)
 
         status_row = ttk.Frame(outer)
         status_row.pack(fill=X, pady=(18, 8))
@@ -415,6 +424,50 @@ class FastFileApp:
             messagebox.showinfo(APP_NAME, "No .ff files were found in the selected folder.")
             return
         self.add_files(files, auto_start=True)
+
+    def on_drop(self, paths: list[Path]) -> None:
+        ffs = [p for p in paths if p.suffix.lower() == ".ff"]
+        zips = [p for p in paths if p.suffix.lower() == ".zip"]
+        if ffs:
+            self.add_files(ffs, auto_start=True)
+        if zips:
+            self.add_repack_files(zips)
+        if not ffs and not zips:
+            self.status_text.set("Drop .ff files to unpack, or folder .zip files to repack.")
+
+    def choose_zip(self) -> None:
+        initial = self.game_folder.get() if Path(self.game_folder.get()).exists() else str(Path.home())
+        names = filedialog.askopenfilenames(
+            title="Choose folder .zip files to repack into .ff",
+            initialdir=initial,
+            filetypes=[("Zip archives", "*.zip"), ("All files", "*.*")],
+        )
+        self.add_repack_files([Path(name) for name in names])
+
+    def add_repack_files(self, paths: list[Path]) -> None:
+        zips = [p.resolve() for p in paths if p.suffix.lower() == ".zip" and p.exists()]
+        if not zips:
+            self.status_text.set("Drop or choose one or more folder .zip files to repack.")
+            return
+        for path in zips:
+            out_ff = path.with_suffix(".ff")
+            self.tree.insert("", END, iid=f"repack::{path}", values=("Queued (repack)", "-", "-", "-", "-", str(out_ff)))
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(APP_NAME, "A job is already running. Try again once it finishes.")
+            return
+        self.worker = threading.Thread(target=self.repack_run, args=(zips,), daemon=True)
+        self.worker.start()
+
+    def repack_run(self, zips: list[Path]) -> None:
+        total = len(zips)
+        for index, path in enumerate(zips, 1):
+            self.work_queue.put(("repack_start", path, index, total))
+            try:
+                result = repack_fastfile_from_zip(path, None, log=lambda msg: self.work_queue.put(("log", msg)))
+                self.work_queue.put(("repack_done", path, result, index, total))
+            except Exception as exc:  # noqa: BLE001 - surface a friendly error, keep going.
+                self.work_queue.put(("repack_error", path, str(exc), traceback.format_exc(), index, total))
+        self.work_queue.put(("finished",))
 
     def add_files(self, paths: list[Path], auto_start: bool = True) -> None:
         files = []
@@ -527,10 +580,32 @@ class FastFileApp:
             self.status_text.set(f"Error extracting {path.name}: {error}")
             (ff_output_dir(path) / "error.txt").parent.mkdir(parents=True, exist_ok=True)
             (ff_output_dir(path) / "error.txt").write_text(details, encoding="utf-8")
+        elif kind == "repack_start":
+            _, path, index, total = event
+            self.status_text.set(f"Repacking {path.name}")
+            self.progress_text.set(f"{index} of {total}")
+            self.progress_value.set(((index - 1) / total) * 100)
+            self.tree.set(f"repack::{path}", "status", "Repacking")
+        elif kind == "repack_done":
+            _, path, result, index, total = event
+            self.tree.set(f"repack::{path}", "status", "Repacked")
+            self.tree.set(f"repack::{path}", "scripts", f"{result.get('chunks', 0)} chunks")
+            self.tree.set(f"repack::{path}", "output", result["output"])
+            self.progress_value.set((index / total) * 100)
+            self.status_text.set(
+                f"Repacked {path.name} -> {Path(result['output']).name} "
+                f"({result.get('chunks', 0)} chunks, {result.get('ff_size', 0)} bytes)."
+            )
+        elif kind == "repack_error":
+            _, path, error, details, index, total = event
+            self.tree.set(f"repack::{path}", "status", "Repack error")
+            self.tree.set(f"repack::{path}", "output", error)
+            self.progress_value.set((index / total) * 100)
+            self.status_text.set(f"Error repacking {path.name}: {error}")
         elif kind == "finished":
             self.pending_files.clear()
             self.progress_text.set("Done")
-            self.status_text.set("Extraction complete. Select a row and open its output folder.")
+            self.status_text.set("Done. Select a row and open its output folder, or find the new .ff beside the .zip.")
 
     def selected_output(self) -> Path | None:
         selected = self.tree.selection()
@@ -543,9 +618,11 @@ class FastFileApp:
     def open_selected_output(self) -> None:
         path = self.selected_output()
         if path is None:
-            messagebox.showinfo(APP_NAME, "Select a completed output folder first.")
+            messagebox.showinfo(APP_NAME, "Select a completed output row first.")
             return
-        os.startfile(path)  # type: ignore[attr-defined]
+        # Repack rows point at a .ff file; open its containing folder instead.
+        target = path if path.is_dir() else path.parent
+        os.startfile(target)  # type: ignore[attr-defined]
 
     def open_selected_subfolder(self, folder_name: str) -> None:
         path = self.selected_output()
@@ -583,8 +660,11 @@ class FastFileApp:
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     startup_files = [Path(arg) for arg in argv if Path(arg).suffix.lower() == ".ff"]
+    startup_zips = [Path(arg) for arg in argv if Path(arg).suffix.lower() == ".zip"]
     root = tk.Tk()
-    FastFileApp(root, startup_files)
+    app = FastFileApp(root, startup_files)
+    if startup_zips:
+        root.after(300, lambda: app.add_repack_files(startup_zips))
     root.mainloop()
     return 0
 

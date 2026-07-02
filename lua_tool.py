@@ -1609,6 +1609,18 @@ def semantic_name_from_expr(value: str, fallback: str) -> str:
     }
     if call in bare_calls:
         return bare_calls[call]
+    # Dvar / profile / table lookups carry their key as a string literal; name
+    # the local after that key instead of a generic dvarValue/valueN.
+    leaf = call.rsplit(".", 1)[-1].rsplit(":", 1)[-1]
+    if leaf in {
+        "DvarBool", "DvarInt", "DvarFloat", "DvarString", "DvarEnum", "Dvar",
+        "ProfileValueAsString", "ProfileInt", "TableLookup",
+    }:
+        literals = re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"', value)
+        if literals:
+            named = camel_from_parts(re.split(r"[_.]+", literals[-1]), fallback)
+            if named != fallback:
+                return named
     if call.endswith(".new") or call.endswith(":new"):
         owner = call.rsplit(".", 1)[0].rsplit(":", 1)[0].split(".")[-1]
         known = {
@@ -2015,10 +2027,12 @@ def source_lines_for_proto(
                     andor_finalize.setdefault(target, [])
                     skip_indices.add(jmp.index)
 
-        # A JMP that lands on the very next instruction is a no-op;
-        # if a bare comparison feeds only that jump, both are dead. Drop them so
-        # they do not surface as `-- control flow` comments.
-        if inst.opname == "JMP" and inst.sbx in {0, 1} and inst.index not in skip_indices:
+        # A JMP that lands on the very next instruction (sBx == 0) is a genuine
+        # no-op; if a bare comparison feeds only that jump, both are dead. Drop
+        # them so they do not surface as `-- control flow` comments. NOTE: sBx==1
+        # is NOT a no-op — it skips one real instruction (e.g. the `return` in
+        # `if cond then return end`) and must be left for the structured-if pass.
+        if inst.opname == "JMP" and inst.sbx == 0 and inst.index not in skip_indices:
             skip_indices.add(inst.index)
             if pos > 0 and meaningful[pos - 1].opname in _COMPARE_OPS and meaningful[pos - 1].index not in bool_value:
                 skip_indices.add(meaningful[pos - 1].index)
@@ -2057,6 +2071,45 @@ def source_lines_for_proto(
                     continue
             structured_ifs[inst.index] = (following, land, "if")
             close_after[land] = close_after.get(land, 0) + 1
+
+    # Single-use temporary inlining: a call producing exactly one result that is
+    # read exactly once, with only side-effect-free instructions between the call
+    # and that use, is inlined into the use site instead of emitting an
+    # unnecessary `local valueN = ...` temporary. Conservative: only c==2 (one
+    # result) calls, and any intervening instruction with side effects disables
+    # inlining to preserve evaluation order.
+    _side_effect_free = {
+        "GETGLOBAL", "GETFIELD", "GETFIELD_R1", "GETFIELD_MM", "GETTABLE", "GETTABLE_S",
+        "GETTABLE_N", "LOADK", "LOADBOOL", "LOADNIL", "MOVE", "NEWTABLE", "GETUPVAL",
+        "CLOSURE", "DATA", "ADD", "ADD_BK", "SUB", "SUB_BK", "MUL", "MUL_BK", "DIV",
+        "DIV_BK", "MOD", "MOD_BK", "POW", "POW_BK", "UNM", "NOT", "NOT_R1", "LEN", "CONCAT",
+    }
+    _call_ops = {"CALL", "CALL_I", "CALL_C", "CALL_M", "CALL_I_R1"}
+    inline_call_regs: set[int] = set()
+    for pos, producer in enumerate(meaningful):
+        if producer.opname not in _call_ops or producer.c != 2:
+            continue
+        reg = producer.a
+        reads: list[int] = []
+        for q in range(pos + 1, len(meaningful)):
+            m = meaningful[q]
+            if reg in read_registers(m):
+                reads.append(q)
+            overwritten = written_register(m) == reg
+            if m.opname == "SELF" and (m.a == reg or m.a + 1 == reg):
+                overwritten = True
+            if m.opname in _call_ops and m.c != 1 and reg in range(m.a, m.a + max(m.c - 1, 0)):
+                overwritten = True
+            if m.opname == "JMP" or m.index in structured_ifs or m.index in generic_loop_starts:
+                # Do not inline across a control-flow boundary.
+                break
+            if overwritten:
+                break
+        if len(reads) != 1:
+            continue
+        between = meaningful[pos + 1 : reads[0]]
+        if all(b.opname in _side_effect_free for b in between):
+            inline_call_regs.add(producer.index)
 
     goto_jumps = {index: label for index, label in goto_jumps.items() if index not in skip_indices}
     active_goto_labels = set(goto_jumps.values())
@@ -2136,14 +2189,22 @@ def source_lines_for_proto(
             loop_regs = list(range(tfor_inst.a + 3, tfor_inst.a + 3 + max(tfor_inst.c, 1)))
             if "ipairs" in iterator:
                 hints = ["index", "value"]
-            elif "pairs" in iterator:
-                hints = ["key", "value"]
             else:
                 hints = ["key", "value"]
-            loop_vars = [local_reg_name(reg, hints[pos] if pos < len(hints) else None) for pos, reg in enumerate(loop_regs)]
-            for reg in loop_regs:
+            # These are fresh loop-scoped control variables; force the semantic
+            # key/value/index names even if the register carried an inferred
+            # name (e.g. valueN) from earlier use.
+            loop_vars = []
+            for pos, reg in enumerate(loop_regs):
+                hint = hints[pos] if pos < len(hints) else "value"
+                previous = local_names.pop(reg, None)
+                if previous:
+                    used_local_names.discard(previous)
+                name = unique_local_name(hint, reg)
+                local_names[reg] = name
+                regs[reg] = name
                 declared.add(reg)
-                regs[reg] = local_reg_name(reg)
+                loop_vars.append(name)
             emit(f"for {', '.join(loop_vars)} in {iterator} do")
             block_depth += 1
             continue
@@ -2245,6 +2306,10 @@ def source_lines_for_proto(
                 continue
             if inst.c == 1:
                 emit(call_expr)
+                regs[inst.a] = call_expr
+            elif inst.index in inline_call_regs:
+                # Single-use temporary: keep the call as an inline expression so
+                # it is emitted at its one use site (no `local valueN =`).
                 regs[inst.a] = call_expr
             else:
                 assign(inst.a, call_expr)

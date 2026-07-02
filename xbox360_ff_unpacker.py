@@ -84,6 +84,21 @@ XCHUNK_SIZE = 0x8000
 XCHUNK_STREAM_COUNT = 4
 XCHUNK_HASH_BLOCKS = 200
 SHA1_SIZE = 20
+
+# Windows: run child processes (the LZX helper) without flashing a console
+# window. Decompressing a large fastfile spawns the helper once per chunk
+# (hundreds of times), which otherwise causes a storm of white console windows
+# in the packaged GUI .exe.
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _no_window_run_kwargs() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0  # SW_HIDE
+    return {"creationflags": CREATE_NO_WINDOW, "startupinfo": startupinfo}
 T6_XBLOCK_NAMES = [
     "temp",
     "runtime_virtual",
@@ -394,6 +409,25 @@ class OatSalsa20ChunkDecryptor:
         for i, value in enumerate(digest):
             self.block_hashes[next_offset + i] ^= value
         return decrypted, iv, digest
+
+    def encrypt(self, stream_number: int, plaintext: bytes) -> tuple[bytes, bytes, bytes]:
+        """Inverse of decrypt for repacking.
+
+        Salsa20 is a stream cipher (XOR), so encryption uses the same keystream.
+        The IV chain hashes the *decrypted* (plaintext) chunk, so on the encrypt
+        side we must hash the plaintext input (not the ciphertext output) to
+        reproduce the exact block-hash chain the game's loader will regenerate.
+        """
+        block_offset = self._hash_block_offset(stream_number)
+        current_block = bytes(self.block_hashes[block_offset : block_offset + SHA1_SIZE])
+        iv = current_block[:8]
+        ciphertext = salsa20_xor(plaintext, BO2_X360_SALSA20_KEY, iv)
+        digest = hashlib.sha1(plaintext).digest()
+        self.indices[stream_number] = (self.indices[stream_number] + 1) % XCHUNK_HASH_BLOCKS
+        next_offset = self._hash_block_offset(stream_number)
+        for i, value in enumerate(digest):
+            self.block_hashes[next_offset + i] ^= value
+        return ciphertext, iv, digest
 
 
 def parse_xmem_lzx_headers(data: bytes, limit: int = 32) -> dict[str, Any]:
@@ -1880,6 +1914,10 @@ class FastFileScanner:
         payload = self.data[PAYLOAD_OFFSET:]
         out_dir.mkdir(parents=True, exist_ok=True)
         zone_path = out_dir / "zone_decompressed.dat"
+        # Preserve the exact 0x138-byte clear header (magic, version, PHEE/Bs71,
+        # fastfile name, and 256-byte signature blob) so the repacker can rebuild
+        # a valid FastFile without having to regenerate the signature.
+        (out_dir / "ff_header.bin").write_bytes(self.data[:PAYLOAD_OFFSET])
         chunks_dir = out_dir / "decompressed_xchunks"
         chunks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1935,6 +1973,7 @@ class FastFileScanner:
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
+                        **_no_window_run_kwargs(),
                     )
                     if completed.returncode != 0:
                         if allow_partial_zone:
@@ -2118,10 +2157,120 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=False), encoding="utf-8")
 
 
+def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None) -> dict[str, Any]:
+    """Rebuild a FastFile from an unpacked folder.
+
+    The folder must contain `zone_decompressed.dat` (the full decompressed zone).
+    Output is a `TAff0100` (deflate) FastFile: the zone is re-chunked, raw-deflated,
+    and Salsa20-encrypted with the same name-seeded IV chain the game regenerates.
+    The original 0x138-byte header (`ff_header.bin`) is reused when present so the
+    fastfile name and 256-byte signature blob are preserved. The magic is forced to
+    `TAff0100` because we emit deflate chunks (BO2 Xbox supports both
+    `TAff0100`/deflate and `TAffx100`/LZX; producing LZX would need an encoder the
+    project does not ship, and the deflate path loads the same zone).
+    """
+
+    def _log(message: str) -> None:
+        if log:
+            log(message)
+
+    zone_path = folder / "zone_decompressed.dat"
+    if not zone_path.exists():
+        raise FileNotFoundError(
+            f"zone_decompressed.dat not found in {folder}. Repack needs a folder produced by unpacking."
+        )
+    zone = zone_path.read_bytes()
+    stem = out_ff.stem
+
+    header_path = folder / "ff_header.bin"
+    if header_path.exists() and header_path.stat().st_size >= PAYLOAD_OFFSET:
+        header = bytearray(header_path.read_bytes()[:PAYLOAD_OFFSET])
+    else:
+        header = bytearray(PAYLOAD_OFFSET)
+        header[0x08:0x0C] = (0x92).to_bytes(4, "big")
+        header[0x0C:0x10] = b"PHEE"
+        header[0x10:0x14] = b"Bs71"
+        _log("ff_header.bin not found; synthesizing a minimal header (signature will be zeroed).")
+
+    # We emit deflate chunks, so the magic must select the deflate loader path.
+    header[0:8] = b"TAff0100"
+    name_bytes = stem.encode("ascii", "replace")[:31]
+    header[0x18 : 0x18 + 32] = name_bytes + b"\x00" * (32 - len(name_bytes))
+    zone_name = stem[:31]
+
+    encryptor = OatSalsa20ChunkDecryptor(zone_name)
+    block_size = 0x7F00  # deflate output of this stays < XCHUNK_SIZE (0x8000)
+    out = bytearray(header)
+    stream = 0
+    chunk_count = 0
+    for pos in range(0, len(zone), block_size):
+        block = zone[pos : pos + block_size]
+        # Raw deflate: strip the 2-byte zlib header and 4-byte adler32 footer so
+        # the game's `inflate(..., wbits=-15)` path can read it.
+        raw = zlib.compress(block, 9)[2:-4]
+        if len(raw) > XCHUNK_SIZE:
+            raise ValueError(f"compressed chunk {chunk_count} exceeds XCHUNK_SIZE: {len(raw)} bytes")
+        ciphertext, _iv, _digest = encryptor.encrypt(stream, raw)
+        out += len(ciphertext).to_bytes(4, "big")
+        out += ciphertext
+        stream = (stream + 1) % XCHUNK_STREAM_COUNT
+        chunk_count += 1
+    out += (0).to_bytes(4, "big")  # zero-size xchunk = end of stream
+
+    out_ff.write_bytes(out)
+    _log(f"Repacked {chunk_count} chunk(s) -> {out_ff.name} ({len(out)} bytes)")
+    return {
+        "output": str(out_ff),
+        "chunks": chunk_count,
+        "zone_size": len(zone),
+        "ff_size": len(out),
+        "used_original_header": header_path.exists(),
+    }
+
+
+def repack_fastfile_from_zip(zip_path: Path, out_ff: Path | None = None, log=None) -> dict[str, Any]:
+    """Repack a `<name>.zip` of an unpacked folder into `<name>.ff`.
+
+    The archive is expected to contain the unpacked folder (the one holding
+    `zone_decompressed.dat`), typically named after the FastFile. Output goes to
+    `<name>.ff` beside the zip unless `out_ff` is given.
+    """
+    import tempfile
+    import zipfile
+
+    stem = zip_path.stem
+    if out_ff is None:
+        out_ff = zip_path.with_suffix(".ff")
+
+    with tempfile.TemporaryDirectory(prefix="ff_repack_") as tmp:
+        tmp_dir = Path(tmp)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp_dir)
+        # Locate the folder that contains zone_decompressed.dat.
+        candidates = [zone.parent for zone in tmp_dir.rglob("zone_decompressed.dat")]
+        if not candidates:
+            raise FileNotFoundError(
+                f"{zip_path.name} does not contain a zone_decompressed.dat "
+                "(zip the unpacked folder produced by the unpacker)."
+            )
+        # Prefer a folder matching the archive name, else the shallowest one.
+        folder = next((c for c in candidates if c.name == stem), None)
+        if folder is None:
+            folder = min(candidates, key=lambda p: len(p.parts))
+        return repack_fastfile_from_folder(folder, out_ff, log=log)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Cautious Xbox 360 BO2 .ff scanner/unpacker scaffold")
-    parser.add_argument("fastfile", type=Path, help="Input Xbox 360 BO2 .ff file")
-    parser.add_argument("-o", "--out", type=Path, default=None, help="Output directory")
+    parser.add_argument("fastfile", type=Path, nargs="?", help="Input Xbox 360 BO2 .ff file to unpack")
+    parser.add_argument(
+        "--repack",
+        type=Path,
+        default=None,
+        metavar="ZIP_OR_FOLDER",
+        help="Repack a folder .zip (or unpacked folder) into a .ff instead of unpacking",
+    )
+    parser.add_argument("-o", "--out", type=Path, default=None, help="Output directory (unpack) or output .ff (repack)")
     parser.add_argument("--metadata", type=Path, default=None, help="Metadata JSON path")
     parser.add_argument("--verbose", action="store_true", help="Print parse progress to stderr")
     parser.add_argument("--dump-unknown", action="store_true", help="Dump unresolved raw regions, including signature/payload")
@@ -2142,6 +2291,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-decrypt-probe", action="store_true", help="Skip low-confidence Salsa20 nonce probes")
     args = parser.parse_args(argv)
 
+    if args.repack is not None:
+        source = args.repack
+        if not source.exists():
+            print(f"error: repack source does not exist: {source}", file=sys.stderr)
+            return 2
+        try:
+            if source.is_dir():
+                out_ff = args.out or source.with_suffix(".ff")
+                result = repack_fastfile_from_folder(source, out_ff, log=lambda m: print(m, file=sys.stderr))
+            else:
+                result = repack_fastfile_from_zip(source, args.out, log=lambda m: print(m, file=sys.stderr))
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            print(f"error: repack failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.fastfile is None:
+        parser.error("a fastfile is required unless --repack is used")
     if not args.fastfile.exists():
         print(f"error: input file does not exist: {args.fastfile}", file=sys.stderr)
         return 2

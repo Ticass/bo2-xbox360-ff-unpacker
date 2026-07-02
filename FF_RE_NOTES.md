@@ -118,14 +118,22 @@ Lua bytecode tool status:
 - Current readable-source quality across the 186-file MP/ZM UI corpus: zero
   `arg0`/`var0`/`slot0`/`local_N`/`fn_N` placeholders, zero unresolved opcodes,
   zero decompile failures, and every file is valid balanced Lua (no open/`end`
-  mismatch). All observed control-flow comments have been eliminated.
+  mismatch). Lossless bytecode round-trip is byte-identical (mp 139/139). One
+  `-- control flow` comment remains corpus-wide (a break/continue inside a
+  numeric `for` in eliteregistrationemailpopup).
+- WARNING: `JMP sBx == 0` is a genuine no-op, but `JMP sBx == 1` skips one REAL
+  instruction (e.g. the `return` in `if cond then return end`). A regression that
+  treated sBx==1 as a no-op silently dropped `if` headers and left stray `end`
+  in ~115 files. Only sBx==0 is a no-op. After ANY control-flow change, re-run a
+  proper block-balance check (count if/function/for/while/repeat vs end/until —
+  NOT `then`/`do`, which elseif inflates) and the lossless round-trip.
 - Control-flow recovery now also handles `and`/`or` short-circuits (`TESTSET`,
   including call operands), boolean-valued comparisons
   (`cmp; JMP; LOADBOOL A 0 1; LOADBOOL A 1 0` -> `x = a op b`), call/`not`
-  boolean-normalization sequences, no-op `JMP sBx=0/1`, redundant branch-exit
-  jumps before `else`/`end`, and explicit `goto` labels for the remaining
-  unstructured backward jump. Total `-- control flow` comments across the corpus
-  fell from ~651 to 0 lines.
+  boolean-normalization sequences, no-op `JMP sBx=0`, redundant branch-exit
+  jumps before `else`/`end`, and explicit `goto` labels for remaining
+  unstructured backward jumps. Total `-- control flow` comments across the corpus
+  fell from ~651 to 1 line.
 - Generic `for ... in` loops are now located from the TFORLOOP back edge (the
   loop-entry JMP is at back-target - 1), fixing nested loops where an inner
   forward JMP also targets the TFORLOOP (previously produced an empty

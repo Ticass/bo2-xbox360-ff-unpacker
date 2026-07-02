@@ -25,12 +25,15 @@ and extracted outputs are intentionally not committed.
 zombie_blabla.ff
 zombie_blabla\
   metadata.json
+  ff_header.bin            (original 0x138 header, used when repacking)
   zone_decompressed.dat
   embedded_scripts.json
   embedded_lua.json
-  scripts\
-  ui_lua\
-  ui_lua_readable\
+  embedded_menu.json
+  scripts\                 (GSC/CSC, extracted verbatim)
+  menus\                   (.menu files, extracted verbatim)
+  ui_lua\                  (compiled Lua bytecode)
+  ui_lua_readable\         (auto-decompiled near-1:1 Lua source)
   ui_lua_decompiled\
   ui_lua_hksasm\
   assets\
@@ -40,6 +43,34 @@ Use **Open Selected Output** in the app to jump straight to a completed folder.
 For Lua-bearing fastfiles, the result table also shows readable Lua,
 decompiled listing, and HKSASM counts, with quick buttons for opening the
 readable/decompiled Lua folders.
+
+## Repacking a FastFile
+
+The app has two options:
+
+- **Unpack** (`Unpack .ff Files`, drag `.ff` onto the app/exe): extracts a
+  fastfile to a folder named after it and auto-decompiles any Lua.
+- **Repack** (`Repack .zip -> .ff`, drag a `.zip` onto the app/exe): rebuilds a
+  fastfile from a zip of a previously-unpacked folder. The zip is named after the
+  target fastfile, e.g. `common_zm.zip` -> `common_zm.ff` (written beside the
+  zip). The zip must contain the unpacked folder (the one holding
+  `zone_decompressed.dat`; keep `ff_header.bin` to preserve the original name and
+  signature blob).
+
+Repack re-chunks `zone_decompressed.dat`, raw-deflates each block, and
+Salsa20-encrypts it with the same name-seeded IV chain the game regenerates. The
+output uses the `TAff0100` (deflate) format, which BO2 Xbox supports natively
+(map fastfiles already use it); LZX (`TAffx100`) output is not produced because
+no LZX encoder is shipped. Verified: repack -> unpack round-trips the zone
+byte-for-byte with zero chunk errors.
+
+CLI equivalents:
+
+```powershell
+python .\xbox360_ff_unpacker.py C:\GAMES\merged2\common_zm.ff --decompress-zone --allow-partial-zone
+python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm.zip
+python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm --out C:\path\to\common_zm.ff
+```
 
 ## Main tools
 
