@@ -316,3 +316,52 @@ The `.hksasm` workflow exposes the same editable fields in a line-oriented text
 format and embeds compressed workspace metadata at EOF for safe rebuilding.
 Length-changing string edits, adding/removing constants, adding/removing
 instructions, and compiling readable Lua source are not implemented yet.
+
+## GSC/CSC decompile and full recompile round-trip
+
+On unpack, every embedded GSC/CSC script is decompiled to editable source under
+`scripts_src/` (verbatim compiled payloads remain in `scripts/`). This uses the
+vendored `gsc-tool`, which is **not** committed — fetch it first:
+
+```powershell
+python .\fetch_gsc_tool.py   # downloads _tools/gsc-tool/gsc-tool.exe (xensik, v1.4.10)
+```
+
+To edit and rebuild a working `.ff`:
+
+1. Unpack a `.ff` (drag it onto the app, or run the unpacker).
+2. Edit files under `<name>_ff_scan/scripts_src/` (GSC/CSC source) and/or
+   `<name>_ff_scan/ui_lua_hksasm/` (Lua HKS assembly).
+3. Repack by dropping the unpacked folder (or its `.zip`) onto the app, or:
+
+```powershell
+python .\xbox360_ff_unpacker.py --repack path\to\<name>_ff_scan -o rebuilt.ff
+```
+
+Only sources whose contents changed since unpack are recompiled; everything else
+is spliced back byte-for-byte. GSC/CSC support arbitrary edits (gsc-tool is a real
+compiler). Lua edits use the lossless HKS-assembly path (same-length constant /
+instruction edits). To recompile in place without producing a `.ff`:
+
+```powershell
+python .\xbox360_ff_unpacker.py --recompile path\to\<name>_ff_scan
+```
+
+The original zone is backed up to `zone_decompressed.dat.orig` on first rebuild.
+
+### Loading rebuilt fastfiles (signature note)
+
+The FastFile header carries an **RSA-2048 signature** (256 bytes at 0x38) that
+only Treyarch can generate, so an edited zone cannot be re-signed and a **stock**
+retail xex rejects it. This is cryptographic, not a tooling gap, and is equally
+true under Xenia (Xenia runs the real xex).
+
+Everything else the loader needs is reproduced correctly — the repacker rebuilds
+the Salsa20 IV chain and the per-chunk SHA-1 integrity chain, verified byte-for-byte
+by re-unpacking the output. So a rebuilt `.ff` loads in **retail T6** when the xex
+has the fastfile signature check patched to always pass (a one-function NOP /
+force-valid). In BO2 that patched MP executable (e.g. `default_mp_patched.xex`)
+runs **both multiplayer and Zombies**. This is still the retail T6 game, not a
+reimplementation such as Plutonium. Keep the rebuilt file's name identical to the
+original — the IV chain is seeded from the fastfile name (rebuild `patch_zm.ff` as
+`patch_zm.ff`).

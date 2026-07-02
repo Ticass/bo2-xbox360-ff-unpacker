@@ -19,6 +19,7 @@ import tkinter as tk
 from lua_tool import cmd_decompile_asm_dir, cmd_decompile_dir, cmd_decompile_source_dir
 from xbox360_ff_unpacker import (
     FastFileScanner,
+    augment_manifest_lua_sources,
     repack_fastfile_from_folder,
     repack_fastfile_from_zip,
     write_json,
@@ -88,7 +89,11 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
     write_json(metadata_path, metadata)
 
     decompressed_zone = metadata.get("decompressed_zone", {})
-    scripts = decompressed_zone.get("embedded_scripts", {}).get("count", 0)
+    embedded_scripts = decompressed_zone.get("embedded_scripts", {})
+    scripts = embedded_scripts.get("count", 0)
+    scripts_decompiled = embedded_scripts.get("decompiled_count", 0)
+    scripts_decompile_failures = embedded_scripts.get("decompile_failures", 0)
+    gsc_tool_found = embedded_scripts.get("gsc_tool_found", False)
     lua_files = decompressed_zone.get("embedded_lua", {}).get("count", 0)
     menu_files = decompressed_zone.get("embedded_menu", {}).get("count", 0)
     partial = decompressed_zone.get("partial_zone", False)
@@ -121,16 +126,27 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
             lua_asm = int(manifest.get("decompiled_asm") or 0)
         except Exception:
             lua_asm = 0
+        # Link RawFile Lua assets to their editable HKS assembly in the repack manifest.
+        try:
+            augment_manifest_lua_sources(out_dir)
+        except Exception:
+            pass
     result_readme = out_dir / "README_EXTRACT_RESULT.txt"
     if scripts or lua_files or menu_files:
         found_lines = [
             f"Compiled GSC/CSC script payloads extracted: {scripts}",
+            f"GSC/CSC scripts decompiled to source (scripts_src): {scripts_decompiled}"
+            + (f" ({scripts_decompile_failures} failed)" if scripts_decompile_failures else ""),
             f"Compiled Lua UI payloads extracted: {lua_files}",
             f"Menu (.menu) payloads extracted: {menu_files}",
         ]
         folder_lines = []
         if scripts:
-            folder_lines.extend(["Open the scripts folder for extracted .gsc/.csc payloads:", str(out_dir / "scripts"), ""])
+            folder_lines.extend(["Open the scripts folder for verbatim compiled .gsc/.csc payloads:", str(out_dir / "scripts"), ""])
+            if scripts_decompiled:
+                folder_lines.extend(["Open the scripts_src folder for decompiled, editable GSC/CSC source:", str(out_dir / "scripts_src"), ""])
+            elif not gsc_tool_found:
+                folder_lines.extend(["GSC/CSC decompile skipped: gsc-tool executable was not found under _tools/gsc-tool/.", ""])
         if menu_files:
             folder_lines.extend(["Open the menus folder for extracted .menu payloads:", str(out_dir / "menus"), ""])
         if lua_files:
@@ -147,8 +163,9 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
                     *found_lines,
                     "",
                     *folder_lines,
-                    "Important: extracted .gsc/.csc/.lua files are compiled Xbox/Treyarch bytecode payloads.",
+                    "Note: scripts/ holds verbatim compiled GSC/CSC bytecode; scripts_src/ holds decompiled, editable GSC/CSC source (gsc-tool). ui_lua holds compiled Lua bytecode.",
                     "Lua readable files are decompiled source with inferred local names/control flow; .hksasm files are editable bytecode assembly.",
+                    "Edit files under scripts_src/ (and Lua) then repack the folder to recompile them back into a working .ff.",
                     "",
                 ]
             ),
@@ -184,6 +201,7 @@ def extract_fastfile(path: Path, lzx_helper: Path, log) -> dict:
         "output": str(out_dir),
         "metadata": str(metadata_path),
         "scripts": scripts,
+        "scripts_decompiled": scripts_decompiled,
         "lua_files": lua_files,
         "menu_files": menu_files,
         "lua_decompiled": lua_decompiled,
@@ -326,11 +344,11 @@ class FastFileApp:
 
         drop = ttk.Frame(outer, style="Panel.TFrame", padding=28)
         drop.pack(fill=X)
-        ttk.Label(drop, text="Drag .ff files here to unpack, or folder .zip files to repack", style="Drop.TLabel").pack(anchor="center")
+        ttk.Label(drop, text="Drag .ff files here to unpack, or an unpacked folder / .zip to repack", style="Drop.TLabel").pack(anchor="center")
         ttk.Label(
             drop,
-            text="Unpack: each .ff extracts to a folder beside it (GSC/CSC, .menu, and auto-decompiled Lua). "
-            "Repack: a folder .zip (e.g. common_zm.zip) rebuilds common_zm.ff beside the zip.",
+            text="Unpack: each .ff extracts to a folder beside it (decompiled GSC/CSC in scripts_src, .menu, Lua). "
+            "Repack: drop the unpacked folder (or its .zip) to recompile edited scripts_src/ and Lua and rebuild the .ff.",
             background="#181b21",
             foreground="#aeb6c2",
             wraplength=760,
@@ -377,6 +395,7 @@ class FastFileApp:
         footer = ttk.Frame(outer)
         footer.pack(fill=X)
         ttk.Button(footer, text="Open Selected Output", command=self.open_selected_output).pack(side=LEFT)
+        ttk.Button(footer, text="Open Decompiled Scripts", command=lambda: self.open_selected_subfolder("scripts_src")).pack(side=LEFT, padx=(8, 0))
         ttk.Button(footer, text="Open Readable Lua", command=lambda: self.open_selected_subfolder("ui_lua_readable")).pack(side=LEFT, padx=(8, 0))
         ttk.Button(footer, text="Open Decompiled Lua", command=lambda: self.open_selected_subfolder("ui_lua_decompiled")).pack(side=LEFT, padx=(8, 0))
         ttk.Button(footer, text="Clear List", command=self.clear_list).pack(side=LEFT, padx=(8, 0))
@@ -427,13 +446,16 @@ class FastFileApp:
 
     def on_drop(self, paths: list[Path]) -> None:
         ffs = [p for p in paths if p.suffix.lower() == ".ff"]
-        zips = [p for p in paths if p.suffix.lower() == ".zip"]
+        # A .zip of an unpacked folder, or an unpacked folder itself (containing
+        # zone_decompressed.dat), can be repacked -> recompiled -> .ff.
+        repackables = [p for p in paths if p.suffix.lower() == ".zip"]
+        repackables += [p for p in paths if p.is_dir() and (p / "zone_decompressed.dat").exists()]
         if ffs:
             self.add_files(ffs, auto_start=True)
-        if zips:
-            self.add_repack_files(zips)
-        if not ffs and not zips:
-            self.status_text.set("Drop .ff files to unpack, or folder .zip files to repack.")
+        if repackables:
+            self.add_repack_files(repackables)
+        if not ffs and not repackables:
+            self.status_text.set("Drop .ff files to unpack, or an unpacked folder / its .zip to repack.")
 
     def choose_zip(self) -> None:
         initial = self.game_folder.get() if Path(self.game_folder.get()).exists() else str(Path.home())
@@ -445,25 +467,40 @@ class FastFileApp:
         self.add_repack_files([Path(name) for name in names])
 
     def add_repack_files(self, paths: list[Path]) -> None:
-        zips = [p.resolve() for p in paths if p.suffix.lower() == ".zip" and p.exists()]
-        if not zips:
-            self.status_text.set("Drop or choose one or more folder .zip files to repack.")
+        sources = [
+            p.resolve()
+            for p in paths
+            if p.exists()
+            and (
+                (p.suffix.lower() == ".zip")
+                or (p.is_dir() and (p / "zone_decompressed.dat").exists())
+            )
+        ]
+        if not sources:
+            self.status_text.set("Drop an unpacked folder (with zone_decompressed.dat) or its .zip to repack.")
             return
-        for path in zips:
-            out_ff = path.with_suffix(".ff")
+        for path in sources:
+            out_ff = (path if path.is_dir() else path.with_suffix("")).with_suffix(".ff")
             self.tree.insert("", END, iid=f"repack::{path}", values=("Queued (repack)", "-", "-", "-", "-", str(out_ff)))
         if self.worker and self.worker.is_alive():
             messagebox.showinfo(APP_NAME, "A job is already running. Try again once it finishes.")
             return
-        self.worker = threading.Thread(target=self.repack_run, args=(zips,), daemon=True)
+        self.worker = threading.Thread(target=self.repack_run, args=(sources,), daemon=True)
         self.worker.start()
 
-    def repack_run(self, zips: list[Path]) -> None:
-        total = len(zips)
-        for index, path in enumerate(zips, 1):
+    def repack_run(self, sources: list[Path]) -> None:
+        total = len(sources)
+        for index, path in enumerate(sources, 1):
             self.work_queue.put(("repack_start", path, index, total))
             try:
-                result = repack_fastfile_from_zip(path, None, log=lambda msg: self.work_queue.put(("log", msg)))
+                if path.is_dir():
+                    # Recompile edited scripts_src/ (and Lua) then rebuild + repack.
+                    out_ff = path.with_suffix(".ff")
+                    result = repack_fastfile_from_folder(
+                        path, out_ff, log=lambda msg: self.work_queue.put(("log", msg)), recompile=True
+                    )
+                else:
+                    result = repack_fastfile_from_zip(path, None, log=lambda msg: self.work_queue.put(("log", msg)))
                 self.work_queue.put(("repack_done", path, result, index, total))
             except Exception as exc:  # noqa: BLE001 - surface a friendly error, keep going.
                 self.work_queue.put(("repack_error", path, str(exc), traceback.format_exc(), index, total))
@@ -588,13 +625,23 @@ class FastFileApp:
             self.tree.set(f"repack::{path}", "status", "Repacking")
         elif kind == "repack_done":
             _, path, result, index, total = event
+            recompile = result.get("recompile") or {}
+            changed = recompile.get("changed", 0) if isinstance(recompile, dict) else 0
             self.tree.set(f"repack::{path}", "status", "Repacked")
             self.tree.set(f"repack::{path}", "scripts", f"{result.get('chunks', 0)} chunks")
+            if changed:
+                self.tree.set(f"repack::{path}", "lua_readable", f"{changed} recompiled")
             self.tree.set(f"repack::{path}", "output", result["output"])
             self.progress_value.set((index / total) * 100)
+            recompile_note = ""
+            if isinstance(recompile, dict):
+                if changed:
+                    recompile_note = f" Recompiled {changed} edited source(s)."
+                if recompile.get("errors"):
+                    recompile_note += f" {len(recompile['errors'])} failed to recompile."
             self.status_text.set(
                 f"Repacked {path.name} -> {Path(result['output']).name} "
-                f"({result.get('chunks', 0)} chunks, {result.get('ff_size', 0)} bytes)."
+                f"({result.get('chunks', 0)} chunks, {result.get('ff_size', 0)} bytes).{recompile_note}"
             )
         elif kind == "repack_error":
             _, path, error, details, index, total = event

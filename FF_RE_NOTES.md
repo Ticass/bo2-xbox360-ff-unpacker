@@ -431,3 +431,42 @@ Example extracted paths:
 8. Build the next broad loader around the `dev_zm.ff` frontier: resolve the post-`MemoryBlock` pointer records and extract the following `overhead.cfg`-style blobs.
 9. Add a generic complex-asset string pointer trace for `WeaponVariantDef` so `ui_zm.ff` can advance past asset index `0`.
 10. Use OAT's T6 ZoneCode files for `menuDef_t` later, after script extraction and broad fastfile unpacking are further along.
+
+## GSC/CSC decompile + full recompile round-trip (implemented)
+
+GSC/CSC scripts are now decompiled to editable source on unpack and recompiled
+back into a working `.ff` on repack, via the vendored `gsc-tool` (xensik, v1.4.10,
+`-g t6 -s xb2`, server=`.gsc` / client=`.csc`; `_tools/gsc-tool/gsc-tool.exe`, not
+committed — run `fetch_gsc_tool.py`). Decompiled source lands in `scripts_src/`;
+verbatim compiled payloads stay in `scripts/`.
+
+Zone-splice format facts (from OpenAssetTools' generated T6 loaders +
+`scriptparsetree_t6_load_db.cpp` / `rawfile_t6_load_db.cpp`, cross-checked by
+measuring real zones):
+
+- `ScriptParseTree` (`.gsc`/`.csc`) and `RawFile` (`.lua`) share one stream
+  layout: 12-byte struct `{const char* name=-1; int len; byte* buffer=-1;}` then
+  the inline name string then the buffer of **`len + 1`** bytes (trailing `\0`).
+- Both buffers load into **`XFILE_BLOCK_VIRTUAL`** (index 5). A net buffer-size
+  change adjusts that block-size field (offset `8 + 5*4`), conservatively.
+- **The zone stream carries no alignment padding** between assets — alignment is
+  applied to destination memory pointers only. Measured: adjacent script records
+  are separated by exactly 1 byte (the buffer's own `+1` null) and `pos % 16` is
+  uniformly random. So a buffer can grow/shrink and the rest of the stream is
+  just shifted; no pointer relocation is needed (all pointers are `-1`/`-2`/null).
+- `zone_size` (prefix offset 0) `== filesize - 40` and is rewritten on rebuild.
+
+`zone_rebuild.py` implements this: `parse_records` → `splice_zone` (rewrite each
+edited buffer + its `len` field, fix the two size fields) → `recompile_and_rebuild`
+(recompile only sources whose sha changed vs the manifest baseline). Regression
+gate `verify_identity` (identity rebuild reproduces the zone byte-for-byte) passes
+on every sample zone incl. the 27 MB `common_zm`. End-to-end verified: editing a
+GSC source, repacking, and re-unpacking yields a byte-identical rebuilt zone with
+the edit present.
+
+Lua recompile uses the existing lossless `.hksasm`/workspace path
+(`lua_tool.compile_source_to_bytecode`, wired via `ui_lua_hksasm` in the manifest);
+47/47 UI Lua files round-trip byte-identical. A from-scratch source-level
+HavokScript compiler (arbitrary readable-`.lua` edits, add/remove instructions)
+still needs a byte-exact full serializer first — parser gaps to close:
+child-proto `align4` padding, header bytes `0x0E`–`0x0F`, and unparsed debug tails.

@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import gsc_tool
+
 
 # Public notes for BO2 fastfiles identify this as the Xbox 360 Salsa20 key.
 # The nonce/counter/framing for the encrypted zone stream is not confirmed here,
@@ -84,6 +86,10 @@ XCHUNK_SIZE = 0x8000
 XCHUNK_STREAM_COUNT = 4
 XCHUNK_HASH_BLOCKS = 200
 SHA1_SIZE = 20
+# T6 XFileBlock index for XFILE_BLOCK_VIRTUAL (per OpenAssetTools T6_Assets.h).
+# ScriptParseTree/RawFile name+buffer allocations live in this destination block,
+# so a recompile that changes buffer sizes must adjust this block's size field.
+XFILE_BLOCK_VIRTUAL_INDEX = 5
 
 # Windows: run child processes (the LZX helper) without flashing a console
 # window. Decompressing a large fastfile spawns the helper once per chunk
@@ -1273,11 +1279,15 @@ def extract_embedded_script_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
 
     script_dir = out_dir / "assets" / "embedded_scripts"
     friendly_script_dir = out_dir / "scripts"
+    source_dir = out_dir / "scripts_src"
     script_dir.mkdir(parents=True, exist_ok=True)
     friendly_script_dir.mkdir(parents=True, exist_ok=True)
     pattern = rb"[\x20-\x7e]{3,}\.(?:gsc|csc)"
     reports: list[dict[str, Any]] = []
     seen_paths: dict[str, int] = {}
+    gsc_exe = gsc_tool.find_gsc_tool()
+    decompiled_count = 0
+    decompile_failures = 0
 
     for match in re.finditer(pattern, data, flags=re.IGNORECASE):
         path_offset = match.start()
@@ -1321,16 +1331,48 @@ def extract_embedded_script_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
         friendly_output_path = friendly_script_dir / friendly_rel
         friendly_output_path.parent.mkdir(parents=True, exist_ok=True)
         friendly_output_path.write_bytes(payload)
+
+        # Decompile the compiled payload to editable source under scripts_src/.
+        is_client = gsc_tool.is_client_script(script_name)
+        source_rel = friendly_rel  # keep the original .gsc/.csc extension + tree
+        source_path = source_dir / source_rel
+        decompile_status = "skipped"
+        decompile_log = ""
+        source_sha256 = None
+        if gsc_exe is not None:
+            result = gsc_tool.decompile(friendly_output_path, is_client=is_client, tool=gsc_exe)
+            if result.get("ok"):
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.write_bytes(result["source"])
+                source_sha256 = hashlib.sha256(result["source"]).hexdigest()
+                decompile_status = "ok"
+                decompiled_count += 1
+            else:
+                decompile_status = "failed"
+                decompile_failures += 1
+            decompile_log = (result.get("log") or "")[:2000]
+        else:
+            decompile_status = "no_gsc_tool"
+
         reports.append(
             {
                 "script_name": script_name,
+                "instance": "client" if is_client else "server",
                 "header_offset": header_offset,
+                # Inline be_u32 buffer length field; the repacker patches this when
+                # a recompiled payload changes size.
+                "zone_length_field_offset": header_offset + 4,
                 "path_offset": path_offset,
                 "payload_offset": payload_offset,
                 "payload_size": length,
                 "payload_magic_hex": payload[:4].hex(),
                 "path": str(output_path),
                 "friendly_path": str(friendly_output_path),
+                "source_path": str(source_path) if decompile_status == "ok" else None,
+                "source_rel": str(source_rel).replace("\\", "/"),
+                "source_sha256": source_sha256,
+                "decompile_status": decompile_status,
+                "decompile_log": decompile_log,
                 "sha256": hashlib.sha256(payload).hexdigest(),
                 "extraction_confidence": "high",
                 "confidence_reason": "Local following-name/following-buffer header, script path, and compiled payload magic all match.",
@@ -1344,7 +1386,14 @@ def extract_embedded_script_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
             "status": "ok",
             "count": len(reports),
             "scripts_root": str(friendly_script_dir),
-            "note": "Extracted .gsc/.csc files are compiled Xbox bytecode payloads, not decompiled source text.",
+            "source_root": str(source_dir),
+            "decompiled_count": decompiled_count,
+            "decompile_failures": decompile_failures,
+            "gsc_tool": str(gsc_exe) if gsc_exe else None,
+            "note": (
+                "scripts/ holds verbatim compiled Xbox bytecode payloads; scripts_src/ "
+                "holds gsc-tool-decompiled editable source (.gsc=server, .csc=client)."
+            ),
             "scripts": reports,
         },
     )
@@ -1353,6 +1402,10 @@ def extract_embedded_script_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
         "count": len(reports),
         "manifest_path": str(manifest_path),
         "scripts_root": str(friendly_script_dir),
+        "source_root": str(source_dir),
+        "decompiled_count": decompiled_count,
+        "decompile_failures": decompile_failures,
+        "gsc_tool_found": gsc_exe is not None,
         "scripts_sample": reports[:50],
     }
 
@@ -1547,6 +1600,148 @@ def extract_embedded_menu_blobs(data: bytes, out_dir: Path) -> dict[str, Any]:
         "menu_root": str(friendly_menu_dir),
         "menu_sample": reports[:50],
     }
+
+
+def write_zone_patch_manifest(out_dir: Path) -> dict[str, Any]:
+    """Consolidate every editable asset into one repack manifest.
+
+    ScriptParseTree (`.gsc`/`.csc`) and RawFile (`.lua`) share the same 12-byte
+    stream header ``{const char* name; int len; byte* buffer;}`` with the buffer
+    stored as ``len + 1`` bytes in ``XFILE_BLOCK_VIRTUAL`` and no stream
+    alignment padding (verified against OpenAssetTools' generated T6 loaders).
+    `zone_rebuild.py` consumes this manifest to map an edited source file back to
+    its exact byte range in ``zone_decompressed.dat`` and to detect which sources
+    changed (via ``source_sha256``). ``.menu`` blobs are listed for reference but
+    have no recompiler.
+    """
+
+    def _load(name: str) -> dict[str, Any]:
+        path = out_dir / name
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    assets: list[dict[str, Any]] = []
+
+    for report in _load("embedded_scripts.json").get("scripts", []):
+        name = report.get("script_name", "")
+        size = int(report.get("payload_size") or 0)
+        assets.append(
+            {
+                "kind": "csc" if name.lower().endswith(".csc") else "gsc",
+                "name": name,
+                "header_offset": report.get("header_offset"),
+                "len_field_offset": report.get("zone_length_field_offset"),
+                "payload_offset": report.get("payload_offset"),
+                "len_field_value": size,
+                "buffer_stream_len": size + 1,  # loader reads len + 1 bytes
+                "block": "XFILE_BLOCK_VIRTUAL",
+                "recompiler": "gsc-tool",
+                "source_root": "scripts_src",
+                "source_rel": report.get("source_rel"),
+                "source_sha256": report.get("source_sha256"),
+                "payload_sha256": report.get("sha256"),
+            }
+        )
+
+    for report in _load("embedded_lua.json").get("lua_files", []):
+        header_offset = report.get("header_offset")
+        size = int(report.get("payload_size") or 0)
+        assets.append(
+            {
+                "kind": "lua",
+                "name": report.get("lua_name"),
+                "header_offset": header_offset,
+                "len_field_offset": (header_offset + 4) if header_offset is not None else None,
+                "payload_offset": report.get("payload_offset"),
+                "len_field_value": size,
+                "buffer_stream_len": size + 1,
+                "block": "XFILE_BLOCK_VIRTUAL",
+                "recompiler": "lua_tool",
+                # Readable Lua source is generated after unpack (in ff_app), so the
+                # source path/baseline hash are filled in then.
+                "source_root": "ui_lua_readable",
+                "source_rel": None,
+                "source_sha256": None,
+                "payload_sha256": report.get("sha256"),
+            }
+        )
+
+    for report in _load("embedded_menu.json").get("menu_files", []):
+        header_offset = report.get("header_offset")
+        size = int(report.get("payload_size") or 0)
+        assets.append(
+            {
+                "kind": "menu",
+                "name": report.get("menu_name"),
+                "header_offset": header_offset,
+                "len_field_offset": (header_offset + 4) if header_offset is not None else None,
+                "payload_offset": report.get("payload_offset"),
+                "len_field_value": size,
+                "buffer_stream_len": size + 1,
+                "block": "XFILE_BLOCK_VIRTUAL",
+                "recompiler": None,  # no .menu compiler; verbatim only
+                "source_root": None,
+                "source_rel": None,
+                "source_sha256": None,
+                "payload_sha256": report.get("sha256"),
+            }
+        )
+
+    manifest = {
+        "zone_file": "zone_decompressed.dat",
+        "zone_size_field_offset": 0,
+        "virtual_block_size_field_offset": 8 + XFILE_BLOCK_VIRTUAL_INDEX * 4,
+        "asset_count": len(assets),
+        "note": (
+            "Repack map for zone_rebuild.py. Edit files under scripts_src/ (and, once "
+            "the Lua compiler lands, ui_lua_readable/) then repack the folder to splice "
+            "recompiled buffers back into zone_decompressed.dat. Buffer stream length is "
+            "len_field_value + 1; no stream alignment padding between assets."
+        ),
+        "assets": assets,
+    }
+    manifest_path = out_dir / "zone_patch_manifest.json"
+    write_json(manifest_path, manifest)
+    return {"status": "ok", "count": len(assets), "manifest_path": str(manifest_path)}
+
+
+def augment_manifest_lua_sources(out_dir: Path) -> int:
+    """Fill in editable Lua source (HKS assembly) paths + baseline hashes.
+
+    Readable/assembly Lua is generated after the zone is unpacked (by the Lua
+    tool), so the manifest's `.lua` entries start without a source mapping. This
+    links each RawFile Lua asset to its `ui_lua_hksasm/<path>.hksasm` file so the
+    repacker knows which edited assembly to recompile. Returns the count linked.
+    """
+    manifest_path = out_dir / "zone_patch_manifest.json"
+    hksasm_dir = out_dir / "ui_lua_hksasm"
+    if not manifest_path.exists() or not hksasm_dir.exists():
+        return 0
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    linked = 0
+    for asset in manifest.get("assets", []):
+        if asset.get("kind") != "lua" or asset.get("source_rel"):
+            continue
+        name = asset.get("name")
+        if not name:
+            continue
+        rel = safe_asset_path(name, ".lua").with_suffix(".hksasm")
+        hksasm_path = hksasm_dir / rel
+        if hksasm_path.exists():
+            asset["source_root"] = "ui_lua_hksasm"
+            asset["source_rel"] = rel.as_posix()
+            asset["source_sha256"] = hashlib.sha256(hksasm_path.read_bytes()).hexdigest()
+            linked += 1
+    if linked:
+        write_json(manifest_path, manifest)
+    return linked
 
 
 def build_readable_string_inventory(data: bytes, out_dir: Path, min_len: int = 5) -> dict[str, Any]:
@@ -2098,6 +2293,11 @@ class FastFileScanner:
         embedded_scripts = extract_embedded_script_blobs(zone_data, out_dir)
         embedded_lua = extract_embedded_lua_blobs(zone_data, out_dir)
         embedded_menu = extract_embedded_menu_blobs(zone_data, out_dir)
+        try:
+            zone_patch_manifest = write_zone_patch_manifest(out_dir)
+        except (OSError, ValueError) as exc:
+            parser_warnings.append(f"zone patch manifest write failed: {exc}")
+            zone_patch_manifest = {"status": "failed", "error": str(exc)}
         if top_level.get("script_strings", {}).get("strings"):
             script_strings_path = out_dir / "script_strings.txt"
             script_strings_path.write_text(
@@ -2146,6 +2346,7 @@ class FastFileScanner:
             "embedded_scripts": embedded_scripts,
             "embedded_lua": embedded_lua,
             "embedded_menu": embedded_menu,
+            "zone_patch_manifest": zone_patch_manifest,
             "readable_string_inventory": build_readable_string_inventory(zone_data, out_dir),
             "first_64_bytes": hex_sample(zone_data, 0, 64),
             "chunks": chunk_reports,
@@ -2157,17 +2358,21 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=False), encoding="utf-8")
 
 
-def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None) -> dict[str, Any]:
+def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile: bool = True) -> dict[str, Any]:
     """Rebuild a FastFile from an unpacked folder.
 
     The folder must contain `zone_decompressed.dat` (the full decompressed zone).
-    Output is a `TAff0100` (deflate) FastFile: the zone is re-chunked, raw-deflated,
-    and Salsa20-encrypted with the same name-seeded IV chain the game regenerates.
-    The original 0x138-byte header (`ff_header.bin`) is reused when present so the
-    fastfile name and 256-byte signature blob are preserved. The magic is forced to
-    `TAff0100` because we emit deflate chunks (BO2 Xbox supports both
-    `TAff0100`/deflate and `TAffx100`/LZX; producing LZX would need an encoder the
-    project does not ship, and the deflate path loads the same zone).
+    When `recompile` is set and a `zone_patch_manifest.json` is present, edited
+    sources under `scripts_src/` (GSC/CSC via gsc-tool) and `ui_lua_readable/`
+    (Lua via lua_tool) are recompiled and spliced back into the zone first (see
+    `zone_rebuild.recompile_and_rebuild`). Output is a `TAff0100` (deflate)
+    FastFile: the zone is re-chunked, raw-deflated, and Salsa20-encrypted with the
+    same name-seeded IV chain the game regenerates. The original 0x138-byte header
+    (`ff_header.bin`) is reused when present so the fastfile name and 256-byte
+    signature blob are preserved. The magic is forced to `TAff0100` because we emit
+    deflate chunks (BO2 Xbox supports both `TAff0100`/deflate and `TAffx100`/LZX;
+    producing LZX would need an encoder the project does not ship, and the deflate
+    path loads the same zone).
     """
 
     def _log(message: str) -> None:
@@ -2179,6 +2384,24 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None) -> dict[st
         raise FileNotFoundError(
             f"zone_decompressed.dat not found in {folder}. Repack needs a folder produced by unpacking."
         )
+
+    recompile_result: dict[str, Any] | None = None
+    if recompile and (folder / "zone_patch_manifest.json").exists():
+        try:
+            import zone_rebuild
+
+            recompile_result = zone_rebuild.recompile_and_rebuild(folder, log=log)
+            if recompile_result.get("changed"):
+                _log(
+                    f"Recompiled {recompile_result['changed']} edited source(s); "
+                    f"zone byte delta {recompile_result.get('byte_delta', 0):+d}."
+                )
+            if recompile_result.get("errors"):
+                _log(f"WARNING: {len(recompile_result['errors'])} source(s) failed to recompile; see result.")
+        except Exception as exc:  # noqa: BLE001 - repack should still work from the raw zone
+            recompile_result = {"status": "failed", "error": str(exc)}
+            _log(f"WARNING: recompile step failed ({exc}); repacking the zone as-is.")
+
     zone = zone_path.read_bytes()
     stem = out_ff.stem
 
@@ -2225,6 +2448,7 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None) -> dict[st
         "zone_size": len(zone),
         "ff_size": len(out),
         "used_original_header": header_path.exists(),
+        "recompile": recompile_result,
     }
 
 
@@ -2270,6 +2494,18 @@ def main(argv: list[str] | None = None) -> int:
         metavar="ZIP_OR_FOLDER",
         help="Repack a folder .zip (or unpacked folder) into a .ff instead of unpacking",
     )
+    parser.add_argument(
+        "--recompile",
+        type=Path,
+        default=None,
+        metavar="FOLDER",
+        help="Recompile edited scripts_src/ (and Lua) and splice them back into the folder's zone_decompressed.dat, without producing a .ff",
+    )
+    parser.add_argument(
+        "--no-recompile",
+        action="store_true",
+        help="During --repack, do NOT recompile edited sources; repack the zone as-is",
+    )
     parser.add_argument("-o", "--out", type=Path, default=None, help="Output directory (unpack) or output .ff (repack)")
     parser.add_argument("--metadata", type=Path, default=None, help="Metadata JSON path")
     parser.add_argument("--verbose", action="store_true", help="Print parse progress to stderr")
@@ -2291,6 +2527,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-decrypt-probe", action="store_true", help="Skip low-confidence Salsa20 nonce probes")
     args = parser.parse_args(argv)
 
+    if args.recompile is not None:
+        import zone_rebuild
+
+        folder = args.recompile
+        if not folder.is_dir():
+            print(f"error: --recompile folder does not exist: {folder}", file=sys.stderr)
+            return 2
+        try:
+            result = zone_rebuild.recompile_and_rebuild(folder, log=lambda m: print(m, file=sys.stderr))
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            print(f"error: recompile failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0 if not result.get("errors") else 1
+
     if args.repack is not None:
         source = args.repack
         if not source.exists():
@@ -2299,7 +2550,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if source.is_dir():
                 out_ff = args.out or source.with_suffix(".ff")
-                result = repack_fastfile_from_folder(source, out_ff, log=lambda m: print(m, file=sys.stderr))
+                result = repack_fastfile_from_folder(
+                    source, out_ff, log=lambda m: print(m, file=sys.stderr), recompile=not args.no_recompile
+                )
             else:
                 result = repack_fastfile_from_zip(source, args.out, log=lambda m: print(m, file=sys.stderr))
         except (OSError, ValueError, FileNotFoundError) as exc:

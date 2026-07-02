@@ -20,3 +20,15 @@ fastfile constants, xchunk framing, and compression/decryption behavior. The
 OpenAssetTools repository itself is not vendored here.
 
 https://github.com/Laupetin/OpenAssetTools
+
+## gsc-tool (GSC/CSC decompiler + compiler)
+
+The pipeline shells out to xensik's `gsc-tool` to decompile and recompile T6
+(Black Ops II) GSC/CSC scripts for Xbox 360 (`-g t6 -s xb2`). The executable is
+downloaded into `_tools/gsc-tool/gsc-tool.exe` and is not committed to this repo
+(`_tools/` is gitignored). Run `fetch_gsc_tool.py` (or download the
+`windows-x64-release.zip` asset from the release page) to obtain it.
+
+Version pinned: 1.4.10. License: GPL-3.0.
+
+https://github.com/xensik/gsc-tool

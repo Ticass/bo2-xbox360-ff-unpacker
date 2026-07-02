@@ -10,8 +10,11 @@ a = Analysis(
     binaries=[],
     datas=[
         (str(root / "_tools" / "xmem_lzx_decompress.exe"), "_tools"),
+        # gsc-tool (GSC/CSC decompiler+compiler). Fetch with fetch_gsc_tool.py
+        # before building; bundled so the frozen app can decompile/recompile scripts.
+        (str(root / "_tools" / "gsc-tool" / "gsc-tool.exe"), "gsc-tool"),
     ],
-    hiddenimports=[],
+    hiddenimports=["gsc_tool", "zone_rebuild"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

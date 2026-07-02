@@ -27,6 +27,7 @@ import math
 import re
 import shlex
 import struct
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1058,6 +1059,28 @@ def rebuild_from_hksasm(path: Path) -> bytes:
         return rebuild_from_workspace(temp_path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def compile_source_to_bytecode(source: bytes | str) -> bytes:
+    """Recompile an edited Lua artifact to Xbox big-endian Havok bytecode.
+
+    Accepts HKS assembly text (``ui_lua_hksasm/*.hksasm``) or a workspace JSON
+    blob. This is the faithful, lossless recompile path: edited constant values
+    and instruction fields are re-applied onto the original chunk, preserving all
+    unknown Havok bytes. Edits that change a value's serialized length are
+    rejected (a full structural HavokScript serializer that re-emits the whole
+    chunk from scratch — required for adding/removing instructions or resizing
+    strings — remains future work; see FF_RE_NOTES.md). Consumed by
+    ``zone_rebuild`` for ``.lua`` (RawFile) assets.
+    """
+    text = source.decode("utf-8") if isinstance(source, (bytes, bytearray)) else source
+    is_workspace_json = text.lstrip()[:1] == "{"
+    with tempfile.TemporaryDirectory(prefix="lua_recompile_") as tmp:
+        artifact = Path(tmp) / ("chunk.workspace.json" if is_workspace_json else "chunk.hksasm")
+        artifact.write_text(text, encoding="utf-8")
+        if is_workspace_json:
+            return rebuild_from_workspace(artifact)
+        return rebuild_from_hksasm(artifact)
 
 
 def format_constant(value: Any) -> str:
