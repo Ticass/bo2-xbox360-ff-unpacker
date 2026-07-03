@@ -83,6 +83,22 @@ SIGNATURE_OFFSET = 0x38
 SIGNATURE_SIZE = 0x100
 PAYLOAD_OFFSET = SIGNATURE_OFFSET + SIGNATURE_SIZE
 XCHUNK_SIZE = 0x8000
+# T6 Xbox 360 chunk-stream layout constants, verified against original TAffx100
+# files in this workspace:
+#  - the first decrypted XMem chunk is the 0x28-byte XFile header;
+#  - following decrypted XMem chunks are at most XCHUNK_MAX_WRITE_SIZE bytes;
+#  - the compressed+encrypted chunk must stay < XCHUNK_SIZE (the game asserts
+#    `size < 32*1024` in db_file_load.cpp);
+#  - the compressed stream is laid out in VANILLA_BUFFER_SIZE windows and a
+#    4-byte chunk-size header is never allowed to straddle a window boundary
+#    (measured from the start of the file); zero padding fills the gap;
+#  - the file ends with a zero suffix (>= MIN, aligned to ALIGN) that the reader
+#    relies on and treats as EOF.
+XCHUNK_MAX_WRITE_SIZE = XCHUNK_SIZE - 0x40  # 0x7FC0
+XFILE_HEADER_CHUNK_SIZE = 0x28
+VANILLA_BUFFER_SIZE = 0x80000
+FILE_SUFFIX_ZERO_MIN_SIZE = 0x40
+FILE_SUFFIX_ZERO_ALIGN = 0x40
 XCHUNK_STREAM_COUNT = 4
 XCHUNK_HASH_BLOCKS = 200
 SHA1_SIZE = 20
@@ -105,6 +121,12 @@ def _no_window_run_kwargs() -> dict[str, Any]:
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = 0  # SW_HIDE
     return {"creationflags": CREATE_NO_WINDOW, "startupinfo": startupinfo}
+
+
+def _xmem_compress_helper_path() -> Path:
+    return SCRIPT_DIR / "_tools" / "xmem_compress.exe"
+
+
 T6_XBLOCK_NAMES = [
     "temp",
     "runtime_virtual",
@@ -1944,6 +1966,11 @@ class FastFileScanner:
         error = None
 
         while offset < len(payload):
+            # Skip the vanilla-buffer padding before a size header (see the
+            # decompress loop and VANILLA_BUFFER_SIZE for the rationale).
+            vanilla_offset = (PAYLOAD_OFFSET + offset) % VANILLA_BUFFER_SIZE
+            if vanilla_offset + 4 > VANILLA_BUFFER_SIZE:
+                offset += VANILLA_BUFFER_SIZE - vanilla_offset
             file_offset = PAYLOAD_OFFSET + offset
             if offset + 4 > len(payload):
                 error = f"trailing {len(payload) - offset} bytes where xchunk size was expected"
@@ -2126,6 +2153,14 @@ class FastFileScanner:
         with tempfile.TemporaryDirectory(prefix="ff_xmem_") as temp_name, zone_path.open("wb") as zone_out:
             temp_dir = Path(temp_name)
             while offset + 4 <= len(payload):
+                # Vanilla-buffer windowing: skip the zero padding the linker
+                # inserts so a 4-byte chunk-size header never straddles a
+                # VANILLA_BUFFER_SIZE boundary (measured from the file start).
+                vanilla_offset = (PAYLOAD_OFFSET + offset) % VANILLA_BUFFER_SIZE
+                if vanilla_offset + 4 > VANILLA_BUFFER_SIZE:
+                    offset += VANILLA_BUFFER_SIZE - vanilla_offset
+                    if offset + 4 > len(payload):
+                        break
                 size_field_offset = PAYLOAD_OFFSET + offset
                 chunk_size = be_u32(payload, offset)
                 offset += 4
@@ -2358,6 +2393,113 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=False), encoding="utf-8")
 
 
+def load_xbox360_chunk_plan(folder: Path, zone_size: int) -> list[int] | None:
+    """Load original decrypted Xbox 360 chunk sizes from unpack metadata."""
+
+    metadata_path = folder / "metadata.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    chunks = metadata.get("xchunks", {}).get("chunks")
+    if not isinstance(chunks, list):
+        return None
+
+    plan: list[int] = []
+    remaining = zone_size
+    for chunk in chunks:
+        if remaining <= 0:
+            break
+        headers = chunk.get("xmem_lzx_headers", {}) if isinstance(chunk, dict) else {}
+        blocks = headers.get("blocks", [])
+        if not isinstance(blocks, list):
+            return None
+        size = 0
+        for block in blocks:
+            if not isinstance(block, dict):
+                return None
+            dst_size = block.get("dst_size")
+            if not isinstance(dst_size, int) or dst_size <= 0:
+                return None
+            size += dst_size
+        if size <= 0:
+            return None
+        size = min(size, remaining)
+        plan.append(size)
+        remaining -= size
+
+    while remaining > 0:
+        size = min(XCHUNK_MAX_WRITE_SIZE, remaining)
+        plan.append(size)
+        remaining -= size
+    return plan or None
+
+
+def xmem_compress_zone_records(
+    zone_path: Path,
+    chunk_size: int,
+    first_chunk_size: int = XFILE_HEADER_CHUNK_SIZE,
+    chunk_plan: list[int] | None = None,
+    log=None,
+) -> list[bytes]:
+    """Compress a decompressed zone into per-chunk XMem/LZX records."""
+
+    helper_path = _xmem_compress_helper_path()
+    if not helper_path.exists():
+        raise FileNotFoundError(
+            f"{helper_path} not found. Build it with: "
+            "csc.exe /platform:x86 /optimize+ /out:_tools\\xmem_compress.exe tools\\xmem_compress.cs"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ff_xmem_compress_") as temp_name:
+        chunks_path = Path(temp_name) / "chunks.xmemstream"
+        plan_path = Path(temp_name) / "chunk_plan.txt"
+        plan_arg = ""
+        if chunk_plan is not None:
+            plan_path.write_text("".join(f"{size:X}\n" for size in chunk_plan), encoding="ascii")
+            plan_arg = str(plan_path)
+        proc = subprocess.run(
+            [
+                str(helper_path),
+                str(zone_path.resolve()),
+                str(chunks_path),
+                f"{chunk_size:X}",
+                "",
+                f"{first_chunk_size:X}",
+                plan_arg,
+            ],
+            cwd=str(SCRIPT_DIR),
+            capture_output=True,
+            text=True,
+            **_no_window_run_kwargs(),
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"xmem_compress failed with exit code {proc.returncode}: {detail}")
+        if log and proc.stderr.strip():
+            log(proc.stderr.strip())
+
+        data = chunks_path.read_bytes()
+
+    records: list[bytes] = []
+    offset = 0
+    while offset < len(data):
+        if offset + 4 > len(data):
+            raise ValueError("truncated xmem_compress length prefix")
+        size = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        if size == 0:
+            raise ValueError("xmem_compress produced an empty chunk")
+        end = offset + size
+        if end > len(data):
+            raise ValueError("truncated xmem_compress chunk payload")
+        records.append(data[offset:end])
+        offset = end
+    return records
+
+
 def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile: bool = True) -> dict[str, Any]:
     """Rebuild a FastFile from an unpacked folder.
 
@@ -2365,14 +2507,12 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
     When `recompile` is set and a `zone_patch_manifest.json` is present, edited
     sources under `scripts_src/` (GSC/CSC via gsc-tool) and `ui_lua_readable/`
     (Lua via lua_tool) are recompiled and spliced back into the zone first (see
-    `zone_rebuild.recompile_and_rebuild`). Output is a `TAff0100` (deflate)
-    FastFile: the zone is re-chunked, raw-deflated, and Salsa20-encrypted with the
+    `zone_rebuild.recompile_and_rebuild`). Output is a `TAffx100` (LZX)
+    FastFile: the zone is re-chunked, XMem/LZX-compressed, and Salsa20-encrypted with the
     same name-seeded IV chain the game regenerates. The original 0x138-byte header
     (`ff_header.bin`) is reused when present so the fastfile name and 256-byte
-    signature blob are preserved. The magic is forced to `TAff0100` because we emit
-    deflate chunks (BO2 Xbox supports both `TAff0100`/deflate and `TAffx100`/LZX;
-    producing LZX would need an encoder the project does not ship, and the deflate
-    path loads the same zone).
+    signature blob are preserved. The magic is forced to `TAffx100` because we emit
+    LZX chunks through Microsoft's XNA `XnaNative.dll` XMem encoder.
     """
 
     def _log(message: str) -> None:
@@ -2415,30 +2555,57 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
         header[0x10:0x14] = b"Bs71"
         _log("ff_header.bin not found; synthesizing a minimal header (signature will be zeroed).")
 
-    # We emit deflate chunks, so the magic must select the deflate loader path.
-    header[0:8] = b"TAff0100"
+    # We emit XMem/LZX chunks, so the magic must select the LZX loader path.
+    header[0:8] = b"TAffx100"
     name_bytes = stem.encode("ascii", "replace")[:31]
     header[0x18 : 0x18 + 32] = name_bytes + b"\x00" * (32 - len(name_bytes))
     zone_name = stem[:31]
 
     encryptor = OatSalsa20ChunkDecryptor(zone_name)
-    block_size = 0x7F00  # deflate output of this stays < XCHUNK_SIZE (0x8000)
     out = bytearray(header)
+    chunk_plan = load_xbox360_chunk_plan(folder, len(zone))
+    if chunk_plan is not None:
+        _log(f"Using original Xbox 360 chunk plan ({len(chunk_plan)} chunks).")
+
+    compressed_chunks = xmem_compress_zone_records(
+        zone_path,
+        XCHUNK_MAX_WRITE_SIZE,
+        first_chunk_size=XFILE_HEADER_CHUNK_SIZE,
+        chunk_plan=chunk_plan,
+        log=log,
+    )
+    # Reproduce the Xbox 360 chunk stream: when unpack metadata is available,
+    # reuse the original decrypted XMem chunk sizes; otherwise fall back to the
+    # pattern observed in original Xbox 360 TAffx100 files. Each chunk is
+    # XMem/LZX-compressed then Salsa20-encrypted and written as
+    # [be32 size][data] cycling XCHUNK_STREAM_COUNT streams, and the 4-byte size
+    # header is never allowed to straddle a VANILLA_BUFFER_SIZE window (measured
+    # from the start of the file, so the offset starts at the header length).
+    # The game's reader depends on this windowing and asserts size < XCHUNK_SIZE;
+    # omitting it makes every load past the first 0x80000 boundary read a bogus
+    # size and crash.
+    vanilla_offset = len(out) % VANILLA_BUFFER_SIZE
     stream = 0
     chunk_count = 0
-    for pos in range(0, len(zone), block_size):
-        block = zone[pos : pos + block_size]
-        # Raw deflate: strip the 2-byte zlib header and 4-byte adler32 footer so
-        # the game's `inflate(..., wbits=-15)` path can read it.
-        raw = zlib.compress(block, 9)[2:-4]
-        if len(raw) > XCHUNK_SIZE:
-            raise ValueError(f"compressed chunk {chunk_count} exceeds XCHUNK_SIZE: {len(raw)} bytes")
+    for raw in compressed_chunks:
         ciphertext, _iv, _digest = encryptor.encrypt(stream, raw)
-        out += len(ciphertext).to_bytes(4, "big")
+        chunk_size = len(ciphertext)
+        if chunk_size >= XCHUNK_SIZE:
+            raise ValueError(f"compressed chunk {chunk_count} is >= XCHUNK_SIZE: {chunk_size} bytes")
+        if vanilla_offset + 4 > VANILLA_BUFFER_SIZE:
+            out += b"\x00" * (VANILLA_BUFFER_SIZE - vanilla_offset)
+            vanilla_offset = 0
+        out += chunk_size.to_bytes(4, "big")
         out += ciphertext
+        vanilla_offset = (vanilla_offset + 4 + chunk_size) % VANILLA_BUFFER_SIZE
         stream = (stream + 1) % XCHUNK_STREAM_COUNT
         chunk_count += 1
-    out += (0).to_bytes(4, "big")  # zero-size xchunk = end of stream
+    # End-of-file zero suffix: the reader treats a zero size as EOF, and the
+    # original linker pads the tail with >= FILE_SUFFIX_ZERO_MIN_SIZE zeros
+    # aligned to FILE_SUFFIX_ZERO_ALIGN ("the game's reader needs it").
+    out += b"\x00" * FILE_SUFFIX_ZERO_MIN_SIZE
+    if len(out) % FILE_SUFFIX_ZERO_ALIGN:
+        out += b"\x00" * (FILE_SUFFIX_ZERO_ALIGN - (len(out) % FILE_SUFFIX_ZERO_ALIGN))
 
     out_ff.write_bytes(out)
     _log(f"Repacked {chunk_count} chunk(s) -> {out_ff.name} ({len(out)} bytes)")

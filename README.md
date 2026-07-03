@@ -57,12 +57,11 @@ The app has two options:
   `zone_decompressed.dat`; keep `ff_header.bin` to preserve the original name and
   signature blob).
 
-Repack re-chunks `zone_decompressed.dat`, raw-deflates each block, and
-Salsa20-encrypts it with the same name-seeded IV chain the game regenerates. The
-output uses the `TAff0100` (deflate) format, which BO2 Xbox supports natively
-(map fastfiles already use it); LZX (`TAffx100`) output is not produced because
-no LZX encoder is shipped. Verified: repack -> unpack round-trips the zone
-byte-for-byte with zero chunk errors.
+Repack mirrors the original Xbox 360 chunk plan from `metadata.json` when
+available, XMem/LZX-compresses each chunk through the bundled XNA-backed helper,
+and Salsa20-encrypts it with the same name-seeded IV chain the game regenerates.
+The output uses the `TAffx100` (LZX) format. Verified: repack -> unpack
+round-trips the zone byte-for-byte with zero chunk errors.
 
 CLI equivalents:
 
@@ -86,6 +85,7 @@ python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm --out C:\path\to\c
     Salsa20 stream setup.
   - Inflates `TAffx100` XMem/LZX chunks through `_tools/xmem_lzx_decompress.exe`.
   - Inflates `TAff0100` chunks as raw deflate.
+  - Repacks as `TAffx100` through `_tools/xmem_compress.exe`.
   - Extracts high-confidence embedded compiled `.gsc`/`.csc` payloads.
   - Extracts high-confidence embedded compiled `.lua` UI payloads.
 - `script_inventory.py`
@@ -108,7 +108,7 @@ python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm --out C:\path\to\c
 
 ## Packaging
 
-Build the LZX helper, then build a shareable Windows executable:
+Build the helpers, then build a shareable Windows executable:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_lzx_helper.ps1
@@ -125,7 +125,8 @@ dist\BO2FastFileUnpacker.exe
 ```
 
 Users can run that executable directly or drag `.ff` files onto it. The LZX
-helper is bundled into the executable by `ff_app.spec`.
+decompress helper and XMem/LZX compress helper are bundled into the executable by
+`ff_app.spec`.
 
 Requirements for packaging:
 
@@ -133,6 +134,7 @@ Requirements for packaging:
 - PyInstaller. `build_windows_app.ps1` installs it if missing.
 - A C compiler for the helper: Visual Studio Build Tools (`cl.exe`) or MinGW-w64
   (`gcc.exe`).
+- .NET Framework C# compiler (`csc.exe`) for `_tools\xmem_compress.exe`.
 
 ## Quick commands
 
