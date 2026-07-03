@@ -8,8 +8,7 @@
 //
 // Usage:  xmem_compress.exe <zone-input> <chunks-output> [chunkSizeHex] [nativeDir] [firstChunkSizeHex] [chunkPlanPath]
 // The zone is split into fixed-size input chunks (default 0x8000), optionally
-// with a different first chunk size or a newline-delimited hex chunk plan read
-// from an original Xbox 360 TAffx100 file's metadata. Each chunk is
+// with a different first chunk size or a newline-delimited hex chunk plan. Each chunk is
 // compressed independently (fresh context = reset per chunk, exactly how the
 // game's loader decompresses) and written to the output as a sequence of
 // records: [uint32 little-endian compressedLen][compressedLen bytes]. The Python

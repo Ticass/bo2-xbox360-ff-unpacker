@@ -2393,48 +2393,28 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=False), encoding="utf-8")
 
 
-def load_xbox360_chunk_plan(folder: Path, zone_size: int) -> list[int] | None:
-    """Load original decrypted Xbox 360 chunk sizes from unpack metadata."""
-
-    metadata_path = folder / "metadata.json"
-    if not metadata_path.exists():
-        return None
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    chunks = metadata.get("xchunks", {}).get("chunks")
-    if not isinstance(chunks, list):
-        return None
+def build_xbox360_lzx_chunk_plan(zone_size: int) -> list[int]:
+    """Split exactly like Xbox 360 LZX fastfiles: 0x28, then 0x7FC0 blocks."""
 
     plan: list[int] = []
     remaining = zone_size
-    for chunk in chunks:
-        if remaining <= 0:
-            break
-        headers = chunk.get("xmem_lzx_headers", {}) if isinstance(chunk, dict) else {}
-        blocks = headers.get("blocks", [])
-        if not isinstance(blocks, list):
-            return None
-        size = 0
-        for block in blocks:
-            if not isinstance(block, dict):
-                return None
-            dst_size = block.get("dst_size")
-            if not isinstance(dst_size, int) or dst_size <= 0:
-                return None
-            size += dst_size
-        if size <= 0:
-            return None
-        size = min(size, remaining)
-        plan.append(size)
-        remaining -= size
-
+    if remaining <= 0:
+        return plan
+    first_size = min(XFILE_HEADER_CHUNK_SIZE, remaining)
+    plan.append(first_size)
+    remaining -= first_size
     while remaining > 0:
         size = min(XCHUNK_MAX_WRITE_SIZE, remaining)
         plan.append(size)
         remaining -= size
-    return plan or None
+    return plan
+
+
+def fastfile_name_from_header(header: bytes, fallback: str) -> str:
+    raw_name = header[0x18 : 0x18 + 32].split(b"\x00", 1)[0]
+    if not raw_name:
+        return fallback[:31]
+    return raw_name.decode("ascii", errors="replace")[:31]
 
 
 def xmem_compress_zone_records(
@@ -2557,15 +2537,14 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
 
     # We emit XMem/LZX chunks, so the magic must select the LZX loader path.
     header[0:8] = b"TAffx100"
-    name_bytes = stem.encode("ascii", "replace")[:31]
+    zone_name = fastfile_name_from_header(header, stem)
+    name_bytes = zone_name.encode("ascii", "replace")[:31]
     header[0x18 : 0x18 + 32] = name_bytes + b"\x00" * (32 - len(name_bytes))
-    zone_name = stem[:31]
 
     encryptor = OatSalsa20ChunkDecryptor(zone_name)
     out = bytearray(header)
-    chunk_plan = load_xbox360_chunk_plan(folder, len(zone))
-    if chunk_plan is not None:
-        _log(f"Using original Xbox 360 chunk plan ({len(chunk_plan)} chunks).")
+    chunk_plan = build_xbox360_lzx_chunk_plan(len(zone))
+    _log(f"Using Xbox 360 LZX chunk split: first 0x{XFILE_HEADER_CHUNK_SIZE:X}, then 0x{XCHUNK_MAX_WRITE_SIZE:X} ({len(chunk_plan)} chunks).")
 
     compressed_chunks = xmem_compress_zone_records(
         zone_path,
@@ -2574,9 +2553,8 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
         chunk_plan=chunk_plan,
         log=log,
     )
-    # Reproduce the Xbox 360 chunk stream: when unpack metadata is available,
-    # reuse the original decrypted XMem chunk sizes; otherwise fall back to the
-    # pattern observed in original Xbox 360 TAffx100 files. Each chunk is
+    # Reproduce the Xbox 360 LZX chunk stream exactly: first the 0x28-byte XFile
+    # header chunk, then 0x7FC0-byte chunks until EOF. Each chunk is
     # XMem/LZX-compressed then Salsa20-encrypted and written as
     # [be32 size][data] cycling XCHUNK_STREAM_COUNT streams, and the 4-byte size
     # header is never allowed to straddle a VANILLA_BUFFER_SIZE window (measured

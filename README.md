@@ -57,11 +57,13 @@ The app has two options:
   `zone_decompressed.dat`; keep `ff_header.bin` to preserve the original name and
   signature blob).
 
-Repack mirrors the original Xbox 360 chunk plan from `metadata.json` when
-available, XMem/LZX-compresses each chunk through the bundled XNA-backed helper,
-and Salsa20-encrypts it with the same name-seeded IV chain the game regenerates.
-The output uses the `TAffx100` (LZX) format. Verified: repack -> unpack
-round-trips the zone byte-for-byte with zero chunk errors.
+Repack splits `zone_decompressed.dat` exactly like Xbox 360 LZX fastfiles: the
+first block is the `0x28` byte XFile header, and every following block is
+`0x7FC0` bytes except the final tail. It XMem/LZX-compresses each block through
+the bundled XNA-backed helper, then Salsa20-encrypts it with the same
+name-seeded IV chain the game regenerates. The output uses the `TAffx100` (LZX)
+format. Verified: repack -> unpack round-trips the zone byte-for-byte with zero
+chunk errors.
 
 CLI equivalents:
 
