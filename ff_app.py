@@ -26,7 +26,9 @@ from xbox360_ff_unpacker import (
 )
 
 
-APP_NAME = "BO2 Xbox 360 FastFile Unpacker"
+BRAND = "crybaby's repacker"
+APP_VERSION = "1.1.0"
+APP_NAME = f"{BRAND} - BO2 Xbox 360 FastFile Unpacker"
 CONFIG_PATH = Path.home() / "AppData" / "Roaming" / "BO2FastFileUnpacker" / "config.json"
 WM_DROPFILES = 0x0233
 GWLP_WNDPROC = -4
@@ -307,7 +309,7 @@ class FastFileApp:
             self.root.after(250, lambda: self.add_files(startup_files, auto_start=True))
 
     def build_ui(self) -> None:
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME}  v{APP_VERSION}")
         self.root.geometry("920x620")
         self.root.minsize(760, 520)
 
@@ -330,7 +332,11 @@ class FastFileApp:
 
         header = ttk.Frame(outer)
         header.pack(fill=X)
-        ttk.Label(header, text="BO2 Xbox 360 FastFile Unpacker", style="Title.TLabel").pack(side=LEFT)
+        title_box = ttk.Frame(header)
+        title_box.pack(side=LEFT)
+        ttk.Label(title_box, text=BRAND, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title_box, text=f"BO2 Xbox 360 FastFile unpacker / repacker  ·  v{APP_VERSION}",
+                  style="Muted.TLabel").pack(anchor="w")
         ttk.Button(header, text="Select Game Folder", style="Accent.TButton", command=self.select_game_folder).pack(side=RIGHT)
 
         folder_row = ttk.Frame(outer)

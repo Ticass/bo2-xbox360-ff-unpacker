@@ -51,7 +51,7 @@ if ($LASTEXITCODE -ne 0) {
 
 python -m PyInstaller $Spec --noconfirm --distpath $Dist --workpath $Build
 
-$Exe = Join-Path $Dist "BO2FastFileUnpacker.exe"
+$Exe = Join-Path $Dist "crybabys-repacker.exe"
 if (-not (Test-Path $Exe)) {
     throw "Build finished but executable was not found: $Exe"
 }

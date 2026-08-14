@@ -369,3 +369,112 @@ runs **both multiplayer and Zombies**. This is still the retail T6 game, not a
 reimplementation such as Plutonium. Keep the rebuilt file's name identical to the
 original — the IV chain is seeded from the fastfile name (rebuild `patch_zm.ff` as
 `patch_zm.ff`).
+
+The function to patch is **`sub_822AA908` at `0x822AA908`** (retail `default_mp.xex`); force
+it to return 1. It is the RSA verify itself: SHA-256 over the whole 16,000-byte accumulated
+hash-block table at `0x82CBC444`, against the 256-byte signature staged at `0x82CBC344`.
+
+Be aware that **an unpatched load does not report an error**. `DB_AuthLoad_End`
+(`0x822AAA28`) responds to a failed verify by adding 2048 to `g_copyInfoCount`
+(`0x82DEA1AC`), so `DB_PostLoadXZone` later walks 2048 never-written entries and dereferences
+a null — the title dies seconds later, several zones on, inside
+`DB_LinkXAssetEntry -> DB_GetXAssetName`, with nothing in the stack pointing at the
+signature. If you are chasing a crash like that, check the signature patch first. Note also
+that `DB_AuthLoad_CheckHeaders` (`0x822AAAC0`) is **not** the check — its result only feeds
+tamper telemetry. Full detail in `FF_RE_NOTES.md`.
+
+## Growing assets: pointer relocation
+
+Editing a zone in place is easy; making an asset **bigger** is not. Zone pointers are stored
+as `((block << 29) | offset) + 1` and resolved against the destination XBlock bases, so
+growing an allocation shifts every later allocation in that block and invalidates every
+encoded pointer past it. `reloc.py` handles that.
+
+It needs a captured pointer table, `zone_ptrs.bin`, recorded from one real load of the stock
+zone. The capture comes from hooking four loader functions in the running game:
+
+| Address | Function | Recorded |
+| --- | --- | --- |
+| `0x822AD610` | `DB_LoadXFileData(dest, size)` | stream-to-address map |
+| `0x822AD760` | `DB_LoadXFileDataNullTerminated(dest)` | string reads (needed, or ~82 KB is unmapped) |
+| `0x822CC358` | `DB_ConvertOffsetToPointer(field)` | pointer field + encoded value |
+| `0x822CC330` | `DB_ConvertOffsetToAlias(field)` | same, plus one deref |
+
+Records are 12 bytes, `{u32 kind, u32 a, u32 b}`; XBlock bases (`kind 4`) are read from
+`*(u32*)0x832DE59C`. `reloc.py`'s docstring documents the format so any hooking setup can
+produce it.
+
+Two things that are easy to get wrong, both documented in `FF_RE_NOTES.md`:
+
+- **Resolve fields temporally, not by address.** XBlock 0 is a reused scratch block; one
+  field there held five different encoded pointers during a single load.
+- **Round the growth up to a multiple of 4096.** The loader pads allocations to an alignment
+  boundary, so a raw +4183-byte payload shifted later allocations by only +4096. Relocating
+  by the raw delta leaves every pointer 87 bytes long and crashes material loading.
+
+```bash
+# 1. capture zone_ptrs.bin from a stock load (see the hook table above)
+# 2. inspect coverage -- both numbers should be complete
+python reloc.py
+#   pointers resolved 11731, stream mapped 7295715 of 7295715 bytes
+#   pointer fields not written from the stream: 0
+```
+
+`inject_gsc.py` replaces a ScriptParseTree payload. It has two modes: **fit** (new payload is
+smaller or equal - zero-pad it, nothing moves, no relocation) and **grow** (larger - go
+through `reloc.py`). Use `gsc_slack.py` to see how much headroom each script already has,
+since gsc-tool output is consistently smaller than Treyarch's compiler:
+
+```bash
+python gsc_slack.py
+#   maps/mp/_createfx.gsc                orig= 47458 recomp= 39014 slack= +8444
+#   maps/mp/zombies/_zm_utility.gsc      orig= 69331 recomp= 64815 slack= +4516
+```
+
+### In the app (crybaby's repacker)
+
+The GUI and the frozen `.exe` go through the same code, so repacking from the app handles
+size changes correctly too. `zone_rebuild.splice_zone` picks the mode for you:
+
+- **fit** - no buffer grew, so each new buffer is zero-padded back to its original stream
+  length and nothing moves. No pointer table needed.
+- **relocate** - a buffer grew, so pointers are relocated via `reloc.py`. This needs a
+  captured `zone_ptrs.bin`; drop it in the unpacked folder (or beside the tool) and it is
+  picked up automatically.
+
+If a buffer grows and no capture is available the rebuild **fails with
+`RelocationRequired`** rather than writing a `.ff` that loads and then corrupts. That is
+deliberate: the old behaviour silently produced broken zones.
+
+The log line tells you which mode ran, e.g.
+`rebuilt zone_decompressed.dat: 1 asset(s) changed, byte delta +8192, new size 7303907 [relocate mode]`.
+
+One subtlety worth knowing if you touch this code: the shift threshold is taken from the
+buffer's **own** XBlock offset, not from the byte after it. The following read often belongs
+to a different XBlock (a block-5 script buffer is followed by a block-0 read), and deriving
+the threshold from it relocates nothing and grows the wrong block.
+
+## Example: a GSC mod menu
+
+`build_menu.py` is an end-to-end example. It decompiles
+`maps/mp/gametypes_zm/_callbacksetup.gsc`, threads `mm_main()` from
+`codecallback_playerconnect`, appends `menu_body.gsc`, recompiles, grows the zone through the
+relocator, and rewrites the length field:
+
+```bash
+python build_menu.py
+#   payload: 5746 -> 13938 bytes (raw delta +4183, padded to +8192 for alignment)
+#   pointers: 129 relocated, 11602 untouched, 0 not written from stream, 0 UNRESOLVED
+#   header: stream 7295675 -> 7303867, XBlock[5] 7286801 -> 7294993
+python xbox360_ff_unpacker.py --repack patch_zm_mod_scan --no-recompile --out patch_zm.ff
+```
+
+`menu_body.gsc` is a small menu - god mode, no clip, infinite ammo - opened with aim + knife,
+navigated with the d-pad, toggled with use.
+
+**Status: confirmed working in game.** The grown zone loads, the zone-health canary matches
+stock exactly, the map reaches gameplay, and the menu opens on screen with aim + knife.
+
+One gotcha when testing: the HUD elements set `hidewheninmenu = 1`, so the panel is hidden
+while the pause menu is up. If the game window was never focused it will have auto-paused, so
+focus it from launch rather than pressing Escape to dismiss the pause menu.

@@ -1,0 +1,33 @@
+# PyInstaller Windows version resource, so the built .exe identifies itself in
+# Explorer's Details tab and in the file properties dialog.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'crybaby'),
+            StringStruct('FileDescription', "crybaby's repacker - BO2 Xbox 360 FastFile unpacker / repacker"),
+            StringStruct('FileVersion', '1.1.0.0'),
+            StringStruct('InternalName', 'crybabys-repacker'),
+            StringStruct('OriginalFilename', 'crybabys-repacker.exe'),
+            StringStruct('ProductName', "crybaby's repacker"),
+            StringStruct('ProductVersion', '1.1.0.0'),
+          ],
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])]),
+  ],
+)
