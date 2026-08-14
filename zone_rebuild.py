@@ -10,17 +10,32 @@ measuring real zones):
 
   i.e. a 12-byte struct ``{const char* name=-1; int len; byte* buffer=-1;}``
   followed inline by the name string and then ``len + 1`` buffer bytes.
-* The zone stream has **no alignment padding** between assets (alignment is
-  applied to destination memory pointers only), so a buffer can grow or shrink
-  and the rest of the stream is simply shifted — no pointer relocation needed.
 * The 40-byte zone prefix stores ``zone_size = filesize - 40`` at offset 0 and
   eight destination XBlock sizes at offset 8. Script/Lua buffers live in
   ``XFILE_BLOCK_VIRTUAL`` (index 5), so a net size change adjusts that block.
 
-Splicing therefore only has to: write the new buffer, rewrite the inline ``len``
-field (``= len(new_buffer) - 1``), copy everything else verbatim, and fix the two
-size fields. An *identity* rebuild (replacing each buffer with its own bytes)
-reproduces the zone byte-for-byte — the regression gate for this module.
+An *identity* rebuild (replacing each buffer with its own bytes) reproduces the
+zone byte-for-byte — the regression gate for this module.
+
+**Correction (measured):** an earlier version of this module claimed the stream has
+no alignment padding, so a buffer could grow and "the rest of the stream is simply
+shifted — no pointer relocation needed". That is wrong twice over, and growing a
+buffer on that assumption produces a zone that loads and then corrupts:
+
+* Zone pointers are stored as ``((block << 29) | offset) + 1`` and resolved against
+  the destination XBlock bases, so every encoded pointer targeting past an
+  insertion has to be rewritten. See :mod:`reloc`.
+* Allocations *are* padded to an alignment boundary, so the shift later allocations
+  experience is not the raw byte delta — a raw +4183-byte payload moved later
+  block-5 allocations by exactly +4096.
+
+:func:`splice_zone` therefore has two modes. When no buffer grows it **fits**: each
+new buffer is zero-padded back to its original stream length and the ``len`` field
+is left alone, so the layout is untouched and no relocation is needed (a compiled
+GSC/Lua chunk carries its own internal sizes, so trailing zeros are never read).
+When a buffer does grow it **relocates**, which requires a captured pointer table
+(``zone_ptrs.bin``); without one the rebuild is refused rather than silently
+producing a broken ``.ff``.
 """
 
 from __future__ import annotations
@@ -37,6 +52,7 @@ import gsc_tool
 
 ZONE_FILE = "zone_decompressed.dat"
 MANIFEST_FILE = "zone_patch_manifest.json"
+PTR_TABLE_FILE = "zone_ptrs.bin"
 PREFIX_SIZE = 40
 ZONE_SIZE_FIELD_OFFSET = 0
 XFILE_BLOCK_VIRTUAL_INDEX = 5
@@ -124,12 +140,30 @@ def parse_records(zone: bytes) -> list[ZoneRecord]:
     return records
 
 
-def splice_zone(zone: bytes, replacements: dict[int, bytes]) -> tuple[bytes, dict[str, Any]]:
+class RelocationRequired(RuntimeError):
+    """A buffer needs to grow but no captured pointer table was supplied."""
+
+
+def splice_zone(
+    zone: bytes,
+    replacements: dict[int, bytes],
+    ptr_table: Path | None = None,
+    log: Callable[[str], None] | None = None,
+) -> tuple[bytes, dict[str, Any]]:
     """Return a new zone with buffers replaced by header_offset.
 
     ``replacements`` maps a record's ``header_offset`` to the complete new buffer
-    bytes (the object the game loads; the ``len`` field is set to ``len(buf)-1``).
+    bytes (the object the game loads; the ``len`` field is ``len(buf)-1``).
+
+    If every new buffer fits in its original stream span this pads with zeros and
+    changes no offsets at all. If any buffer grows, ``ptr_table`` must point at a
+    captured ``zone_ptrs.bin`` so pointers can be relocated; otherwise
+    :class:`RelocationRequired` is raised rather than emitting a broken zone.
     """
+    def say(msg: str) -> None:
+        if log:
+            log(msg)
+
     records = []
     for header_offset in replacements:
         record = read_record_at(zone, header_offset)
@@ -138,39 +172,90 @@ def splice_zone(zone: bytes, replacements: dict[int, bytes]) -> tuple[bytes, dic
         records.append(record)
     records.sort(key=lambda r: r.buffer_offset)
 
-    out = bytearray()
-    cursor = 0
-    total_delta = 0
+    grown = [r for r in records if len(replacements[r.header_offset]) > r.buffer_stream_len]
+
+    # ---- fit mode: nothing moves, so no relocation is possible or needed ----
+    if not grown:
+        out = bytearray(zone)
+        padded = 0
+        for record in records:
+            new_buffer = replacements[record.header_offset]
+            pad = record.buffer_stream_len - len(new_buffer)
+            if pad:
+                padded += 1
+            out[record.buffer_offset : record.buffer_end] = new_buffer + bytes(pad)
+            # len field stays as-is: the span is unchanged, so the stream stays in sync.
+        if padded:
+            say(f"fit mode: {padded} buffer(s) zero-padded to their original length; "
+                "no offsets changed, no relocation needed")
+        return bytes(out), {
+            "records_replaced": len(records),
+            "byte_delta": 0,
+            "new_zone_size": len(out),
+            "new_zone_size_field": len(out) - PREFIX_SIZE,
+            "mode": "fit",
+            "relocated_pointers": 0,
+            "unresolved_pointers": 0,
+        }
+
+    # ---- grow mode: relocate ----
+    if ptr_table is None or not Path(ptr_table).exists():
+        raise RelocationRequired(
+            f"{len(grown)} buffer(s) are larger than the originals, which shifts later "
+            "allocations and invalidates encoded zone pointers. That needs a captured "
+            f"pointer table ({PTR_TABLE_FILE}); see reloc.py for the capture format. "
+            "Without it, shrink the edit so it fits the original size instead."
+        )
+
+    import reloc
+
+    zmap = reloc.ZoneMap(Path(ptr_table), zone)
+    say(f"pointer table: {len(zmap.ptrs)} pointers, "
+        f"{zmap.stream_end}/{len(zone)} stream bytes mapped, {zmap.unstreamed} unstreamed")
+
+    # Plan an aligned growth per record, inserting right after its old buffer span.
+    plan: list[tuple[ZoneRecord, bytes, int]] = []
+    insertions: list[tuple[int, int, int, int]] = []
     for record in records:
         new_buffer = replacements[record.header_offset]
-        # Copy everything up to this buffer verbatim, then patch the inline len
-        # field (which lives inside that copied span at len_field_offset).
-        span = bytearray(zone[cursor : record.buffer_offset])
-        struct.pack_into(">I", span, record.len_field_offset - cursor, len(new_buffer) - 1)
-        out += span
-        out += new_buffer
-        cursor = record.buffer_end
-        total_delta += len(new_buffer) - record.buffer_stream_len
-    out += zone[cursor:]
+        raw = len(new_buffer) - record.buffer_stream_len
+        delta = reloc.align_growth(raw) if raw > 0 else 0
+        span = record.buffer_stream_len + delta
+        plan.append((record, new_buffer + bytes(span - len(new_buffer)), delta))
+        if delta:
+            # Derive the shift threshold from the buffer's OWN block offset. The byte after
+            # the buffer belongs to the next read, which may target a different XBlock
+            # (measured: a block-5 script buffer followed by a block-0 read), and using it
+            # relocates nothing and grows the wrong block.
+            block, block_off = zmap.locate(record.buffer_offset)
+            insertions.append((record.buffer_end, delta, block, block_off + record.buffer_stream_len))
+            say(f"{record.name}: {record.buffer_stream_len} -> {len(new_buffer)} bytes "
+                f"(raw {raw:+d}, padded to {delta:+d} for alignment), "
+                f"XBlock {block} from offset 0x{block_off + record.buffer_stream_len:X}")
 
-    # Fix the zone-size prefix field (post-prefix stream length).
-    struct.pack_into(">I", out, ZONE_SIZE_FIELD_OFFSET, len(out) - PREFIX_SIZE)
-    # Conservatively adjust the virtual destination block. Over-allocation is
-    # safe; under-allocation would overflow into the next block, so a per-record
-    # alignment slack is added when growing.
-    if total_delta != 0:
-        old_virtual = _be_u32(out, VIRTUAL_BLOCK_SIZE_FIELD_OFFSET)
-        slack = MAX_BUFFER_ALIGN * len(records) if total_delta > 0 else 0
-        new_virtual = max(0, old_virtual + total_delta + slack)
-        struct.pack_into(">I", out, VIRTUAL_BLOCK_SIZE_FIELD_OFFSET, new_virtual & 0xFFFFFFFF)
+    relocated, report = reloc.relocate_multi(zone, zmap, insertions, log=say)
+    out = bytearray(relocated)
 
-    info = {
+    # Write buffers at their post-insertion positions, earliest first.
+    shift = 0
+    for record, buffer, delta in plan:
+        struct.pack_into(">I", out, record.len_field_offset + shift, len(buffer) - 1)
+        out[record.buffer_offset + shift : record.buffer_offset + shift + len(buffer)] = buffer
+        shift += delta
+
+    total_delta = report["byte_delta"]
+    if _be_u32(out, ZONE_SIZE_FIELD_OFFSET) != len(out) - PREFIX_SIZE:
+        raise AssertionError("zone size field does not match the rebuilt stream length")
+
+    return bytes(out), {
         "records_replaced": len(records),
         "byte_delta": total_delta,
         "new_zone_size": len(out),
         "new_zone_size_field": len(out) - PREFIX_SIZE,
+        "mode": "relocate",
+        "relocated_pointers": report["relocated"],
+        "unresolved_pointers": report["unresolved"],
     }
-    return bytes(out), info
 
 
 def identity_rebuild(zone: bytes) -> bytes:
@@ -196,6 +281,7 @@ def recompile_and_rebuild(
     folder: Path,
     log: Callable[[str], None] | None = None,
     force: bool = False,
+    ptr_table: Path | None = None,
 ) -> dict[str, Any]:
     """Recompile changed sources under ``folder`` and rewrite ``zone_decompressed.dat``.
 
@@ -289,7 +375,14 @@ def recompile_and_rebuild(
             "note": "No edited sources detected; zone unchanged.",
         }
 
-    rebuilt_zone, info = splice_zone(zone, replacements)
+    if ptr_table is None:
+        # Accept a capture dropped either in the unpacked folder or beside the tool.
+        for candidate in (folder / PTR_TABLE_FILE, Path(PTR_TABLE_FILE)):
+            if candidate.exists():
+                ptr_table = candidate
+                break
+
+    rebuilt_zone, info = splice_zone(zone, replacements, ptr_table=ptr_table, log=_log)
 
     backup = folder / (ZONE_FILE + ".orig")
     if not backup.exists():
@@ -297,7 +390,8 @@ def recompile_and_rebuild(
     zone_path.write_bytes(rebuilt_zone)
     _log(
         f"rebuilt {ZONE_FILE}: {len(changed)} asset(s) changed, "
-        f"byte delta {info['byte_delta']:+d}, new size {info['new_zone_size']}"
+        f"byte delta {info['byte_delta']:+d}, new size {info['new_zone_size']} "
+        f"[{info['mode']} mode]"
     )
 
     return {
@@ -308,6 +402,9 @@ def recompile_and_rebuild(
         "rebuilt": True,
         "byte_delta": info["byte_delta"],
         "new_zone_size": info["new_zone_size"],
+        "mode": info["mode"],
+        "relocated_pointers": info["relocated_pointers"],
+        "unresolved_pointers": info["unresolved_pointers"],
         "backup": str(backup),
         "changed_assets": changed,
     }
@@ -320,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("folder", type=Path, help="Unpacked FastFile folder (contains zone_decompressed.dat)")
     parser.add_argument("--force", action="store_true", help="Recompile all sources, not just changed ones")
     parser.add_argument("--verify-identity", action="store_true", help="Only check the identity-rebuild regression gate")
+    parser.add_argument("--ptr-table", type=Path, default=None,
+                        help=f"Captured pointer table ({PTR_TABLE_FILE}); required to grow a buffer")
     args = parser.parse_args(argv)
 
     if args.verify_identity:
@@ -328,7 +427,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"identity rebuild byte-identical: {ok}")
         return 0 if ok else 1
 
-    result = recompile_and_rebuild(args.folder, log=lambda m: print(m), force=args.force)
+    result = recompile_and_rebuild(args.folder, log=lambda m: print(m), force=args.force,
+                                   ptr_table=args.ptr_table)
     print(json.dumps({k: v for k, v in result.items() if k != "changed_assets"}, indent=2))
     return 0 if result.get("status") == "ok" and not result.get("errors") else 1
 

@@ -4,6 +4,9 @@ from pathlib import Path
 
 root = Path(SPECPATH)
 
+BRAND = "crybaby's repacker"
+APP_VERSION = "1.1.0"
+
 a = Analysis(
     [str(root / "ff_app.py")],
     pathex=[str(root)],
@@ -31,7 +34,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="BO2FastFileUnpacker",
+    name="crybabys-repacker",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -44,4 +47,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=str(root / "version_info.txt"),
 )

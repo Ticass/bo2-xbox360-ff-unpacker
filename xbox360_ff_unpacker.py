@@ -2630,7 +2630,8 @@ def repack_fastfile_from_zip(zip_path: Path, out_ff: Path | None = None, log=Non
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Cautious Xbox 360 BO2 .ff scanner/unpacker scaffold")
+    parser = argparse.ArgumentParser(
+        epilog="crybaby's repacker - BO2 Xbox 360 FastFile unpacker / repacker",description="Cautious Xbox 360 BO2 .ff scanner/unpacker scaffold")
     parser.add_argument("fastfile", type=Path, nargs="?", help="Input Xbox 360 BO2 .ff file to unpack")
     parser.add_argument(
         "--repack",

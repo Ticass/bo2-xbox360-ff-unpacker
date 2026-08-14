@@ -431,6 +431,29 @@ python gsc_slack.py
 #   maps/mp/zombies/_zm_utility.gsc      orig= 69331 recomp= 64815 slack= +4516
 ```
 
+### In the app (crybaby's repacker)
+
+The GUI and the frozen `.exe` go through the same code, so repacking from the app handles
+size changes correctly too. `zone_rebuild.splice_zone` picks the mode for you:
+
+- **fit** - no buffer grew, so each new buffer is zero-padded back to its original stream
+  length and nothing moves. No pointer table needed.
+- **relocate** - a buffer grew, so pointers are relocated via `reloc.py`. This needs a
+  captured `zone_ptrs.bin`; drop it in the unpacked folder (or beside the tool) and it is
+  picked up automatically.
+
+If a buffer grows and no capture is available the rebuild **fails with
+`RelocationRequired`** rather than writing a `.ff` that loads and then corrupts. That is
+deliberate: the old behaviour silently produced broken zones.
+
+The log line tells you which mode ran, e.g.
+`rebuilt zone_decompressed.dat: 1 asset(s) changed, byte delta +8192, new size 7303907 [relocate mode]`.
+
+One subtlety worth knowing if you touch this code: the shift threshold is taken from the
+buffer's **own** XBlock offset, not from the byte after it. The following read often belongs
+to a different XBlock (a block-5 script buffer is followed by a block-0 read), and deriving
+the threshold from it relocates nothing and grows the wrong block.
+
 ## Example: a GSC mod menu
 
 `build_menu.py` is an end-to-end example. It decompiles
@@ -449,9 +472,9 @@ python xbox360_ff_unpacker.py --repack patch_zm_mod_scan --no-recompile --out pa
 `menu_body.gsc` is a small menu - god mode, no clip, infinite ammo - opened with aim + knife,
 navigated with the d-pad, toggled with use.
 
-**Status:** the grown zone loads, the zone-health canary matches stock exactly, and the map
-reaches gameplay with players connecting and spawning through the modified script. The menu
-panel itself has **not** been confirmed on screen yet; its HUD elements set
-`hidewheninmenu = 1`, so verifying it needs the game window focused from launch (otherwise
-the title auto-pauses on focus change and the panel is hidden by design). Treat the menu's
-on-screen behaviour as untested.
+**Status: confirmed working in game.** The grown zone loads, the zone-health canary matches
+stock exactly, the map reaches gameplay, and the menu opens on screen with aim + knife.
+
+One gotcha when testing: the HUD elements set `hidewheninmenu = 1`, so the panel is hidden
+while the pause menu is up. If the game window was never focused it will have auto-paused, so
+focus it from launch rather than pressing Escape to dismiss the pause menu.

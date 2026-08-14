@@ -671,15 +671,12 @@ and runs: the player connects and spawns, and that path goes straight through
 `maps/mp/gametypes_zm/_callbacksetup.gsc`, threading `mm_main()` from
 `codecallback_playerconnect`, and rebuild `patch_zm.ff` through the relocator.
 
-Verified: the grown zone loads, the zone-health canary matches stock exactly, and the map
-reaches gameplay with players connecting and spawning through the modified script (two
-spawns observed over a 130 s run, no crash).
+Confirmed working in game: the grown zone loads, the zone-health canary matches stock
+exactly, the map reaches gameplay, and the menu opens on screen with aim + knife.
 
-Not yet verified: the menu panel itself has not been photographed on screen. The HUD elements
-are created with `hidewheninmenu = 1`, so they are deliberately hidden while the pause menu
-is up, and driving the open combo (aim + knife) through synthetic input needs the game window
-focused from launch - otherwise the title auto-pauses on focus change and the panel stays
-hidden by design. Treat the menu's on-screen behaviour as untested.
+Testing gotcha: the HUD elements use `hidewheninmenu = 1`, so the panel is hidden while the
+pause menu is up. Keep the game window focused from launch - if it was never focused the
+title has auto-paused, and pressing Escape navigates that menu rather than dismissing it.
 
 Builtins used by the menu were each confirmed present in the retail T6 string table:
 `adsbuttonpressed`, `meleebuttonpressed`, `actionslotonebuttonpressed`,

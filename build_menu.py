@@ -33,7 +33,8 @@ def main():
     run([GSC, "-m", "decomp", "-g", "t6", "-s", "xb2", "-i", "server", base], WORK)
     src = (WORK / "decompiled/t6" / base).read_text()
 
-    hook_old = "    self thread maps\mp\_audio::monitor_player_sprint();\n"
+    hook_old = ("    self thread maps" + chr(92) + "mp" + chr(92)
+                + "_audio::monitor_player_sprint();" + chr(10))
     hook_new = hook_old + "    self thread mm_main();\n"
     assert hook_old in src, "player-connect hook site not found"
     src = src.replace(hook_old, hook_new, 1)
