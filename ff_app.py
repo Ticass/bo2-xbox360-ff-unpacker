@@ -27,7 +27,7 @@ from xbox360_ff_unpacker import (
 
 
 BRAND = "crybaby's repacker"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 APP_NAME = f"{BRAND} - BO2 Xbox 360 FastFile Unpacker"
 CONFIG_PATH = Path.home() / "AppData" / "Roaming" / "BO2FastFileUnpacker" / "config.json"
 WM_DROPFILES = 0x0233
