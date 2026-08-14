@@ -40,3 +40,18 @@
 *.zone
 *.xpak
 *.iwd
+
+# Zone rebuild/relocation workspaces (hold extracted game content)
+/*_mod_scan/
+/_build/
+/_work/
+/rt_check/
+/rt2/
+/menu_src/
+*.dat
+
+# Captured pointer tables (derived from game data, machine-specific)
+/zone_ptrs*.bin
+
+# Native helper build artifacts
+*.obj

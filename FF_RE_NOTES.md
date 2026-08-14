@@ -401,16 +401,17 @@ Example extracted paths:
 
 ## Unknowns to investigate
 
+(Resolved since: post-decompression zone header layout, the packed block-offset
+pointer encoding, and whether ScriptParseTree buffers are inline. See the resolved
+sections lower in this file.)
+
 - Meaning of `PHEE`.
 - Meaning of `Bs71`.
 - Whether bytes at `0x0014` are always zero or can contain flags.
 - Whether signature bytes at `0x0038..0x0137` participate in nonce derivation.
 - Meaning of xchunk EOF/padding bytes after the final zero marker, beyond the observed all-zero padding.
-- Post-decompression zone header layout for Xbox 360 BO2.
 - Exact per-asset body parsing for Xbox 360 BO2.
 - `menuDef_t` body layout and how its pointers map to readable command strings.
-- Whether `ScriptParseTree` buffers are inline in the decompressed stream, separately block-ordered, or require explicit pointer following.
-- Full meaning of observed pointer values such as direct low offsets (`0x00012D3C -> "TeamAlt"`) versus OAT-style packed block offset pointers.
 - Why Xbox `MemoryBlock` stream layout differs from OAT's generated T6 struct test, which reports `MemoryBlock` as 20 bytes.
 - How `ZoneInputStream::PushBlock` maps to the physical decompressed stream. OAT loaders push `XFILE_BLOCK_TEMP` for asset structs and `XFILE_BLOCK_VIRTUAL` for names/buffers, but the decompressed byte order around `0x920A` is not yet fully explained.
 - Whether Xbox type `42` should be treated as RawFile-like in some zones, or whether the OAT T6 enum is correct but the asset body is platform/transient data with a different layout.
@@ -470,3 +471,221 @@ Lua recompile uses the existing lossless `.hksasm`/workspace path
 HavokScript compiler (arbitrary readable-`.lua` edits, add/remove instructions)
 still needs a byte-exact full serializer first — parser gaps to close:
 child-proto `align4` padding, header bytes `0x0E`–`0x0F`, and unparsed debug tails.
+
+## Post-decompression zone header layout (resolved)
+
+Previously listed under "Unknowns to investigate". The first 40 bytes of the decompressed
+zone are ten big-endian `u32`:
+
+| Offset | Meaning |
+| --- | --- |
+| `0x00` | total stream size *after* this 40-byte header |
+| `0x04` | zero in every zone observed |
+| `0x08`..`0x24` | the **8 XBlock sizes**, in XBlock index order |
+
+For retail `patch_zm.ff` (zone 7,295,715 bytes) that reads:
+
+```
+[0] 7295675   = 7295715 - 40      total stream bytes
+[2] 4780      XBlock 0
+[7] 7286801   XBlock 5   <- ~99.9% of the zone lives here
+[8] 49548     XBlock 6
+```
+
+Blocks 1-4 and 7 are zero for this zone. Growing an allocation therefore means bumping
+`0x00` **and** the owning block's size field; the loader allocates each block from these
+sizes, so leaving them stale gives a zone that loads and then corrupts.
+
+## Zone pointer encoding (resolved)
+
+Also previously an unknown ("OAT-style packed block offset pointers").
+`DB_ConvertOffsetToPointer` at `0x822CC358` is ten instructions:
+
+```
+v      = *p - 1
+idx    = (v >> 29) & 7          ; rlwinm r9, r11, 6,26,28   -- x8 for the XBlock stride
+offset = v & 0x1FFFFFFF         ; clrlwi r11, r11, 3
+*p     = g_streamBlocks[idx].data + offset
+```
+
+`g_streamBlocks` is `*(u32*)0x832DE59C`, an array of 8-byte entries with `.data` first.
+`DB_ConvertOffsetToAlias` at `0x822CC330` is the same decode plus one extra dereference.
+
+So a stored pointer field is one of:
+
+- `0x00000000` - null
+- `0xFFFFFFFF` - the data follows inline in the stream (this is what RawFile and
+  ScriptParseTree name/buffer fields use)
+- `((block << 29) | offset) + 1` - an offset into a destination XBlock
+
+Measured on `patch_zm.ff`: **11,731** encoded pointers, **all** targeting XBlock 5.
+
+## The signature check, and its booby-trapped failure path
+
+The README already notes the RSA-2048 signature at header `0x38`. The exact check and,
+more importantly, *how it fails*, are worth recording because an unpatched load produces
+no error message at all.
+
+`sub_822AA908` at **`0x822AA908`** is the verifier:
+
+```c
+h   = OpenHashAlgorithm("sha256");
+key = ImportPublicKey(<270-byte blob built by sub_822A98F8>);
+ok  = VerifySignature(sig  = 0x82CBC344, 256 bytes,
+                      data = 0x82CBC444, 16000 bytes, ..., h, 8, &out);
+return out == 1;
+```
+
+The signed data is the **entire 16,000-byte accumulated hash-block table** - the XOR chain
+of every chunk's SHA-1. Any content change invalidates it, and it cannot be recomputed.
+
+The failure path is in `DB_AuthLoad_End` at **`0x822AAA28`**:
+
+```c
+if (sub_822AA908() == 0) {
+    *(int *)0x82DEA1AC += 2048;   /* g_copyInfoCount */
+    authFlags |= 0x20;
+}
+```
+
+`0x82DEA1AC` is `g_copyInfoCount`, used by `DB_PostLoadXZone` (`0x822CAB80`) to walk
+`g_copyInfo` (`0x82FC2848`) and call `DB_LinkXAssetEntry` on each entry. Adding 2048 makes
+it walk 2048 never-written slots and dereference a null, so the title dies **seconds later,
+several zones on**, inside `DB_LinkXAssetEntry -> DB_GetXAssetName`, with nothing in the
+stack pointing back at the signature. Symptom, same binary:
+
+| fastfile | `g_copyInfoCount` at PostLoadXZone #2 | null slots |
+| --- | --- | --- |
+| stock | 1 | 0 |
+| any content edit | **2049** | **2048** |
+
+Two dead ends worth naming so they are not re-investigated:
+
+- `DB_AuthLoad_CheckHeaders` (`0x822AAAC0`) is **not** the patch point. Its verdict only
+  feeds `LiveTracker_WriteForAllLocalUsers(8, 1)` - tamper telemetry. It does not gate the
+  load.
+- The per-chunk SHA-1 in `DB_AuthLoad_AnalyzeData` (`0x822AA110`) is never compared against
+  anything stored in the file; it only derives the next chunk's Salsa20 IV.
+
+Forcing `sub_822AA908` to return 1 skips both the counter sabotage and the `0x20` flag, and
+is the single change needed for repacked zones to load.
+
+`DB_PostLoadXZone` makes an excellent canary: dumping `g_copyInfoCount` plus a null-slot
+count there detects this trap, and any relocation mistake, immediately.
+
+## Verifying that a rebuilt zone is byte-correct
+
+Independent of the signature, the repack itself was confirmed correct end to end against a
+1-character, size-neutral edit rebuilt to the *same* file size with every chunk at its
+original offset:
+
+1. The rebuilt `.ff` re-unpacks to exactly the intended zone.
+2. After decryption only the edited chunk differs - same length, different LZX bitstream.
+   All other 224 chunks are bit-identical. IV rekeying propagates exactly **one** step,
+   because the following chunks' plaintext is unchanged so their SHA-1s are unchanged.
+3. XMem sub-block framing is unchanged: `FF 7F C0 15 BC` - the `0xFF` form, dst `0x7FC0`,
+   src `0x15BC`.
+4. The game's own per-chunk IVs and SHA-1s match the Python chain on every chunk.
+5. Hooking immediately after `bl sub_827D31F0` (XMemDecompressStream) inside
+   `DB_DecompressIOStream`, at **`0x822ACF78`**, every decompressed chunk the game produced
+   is an exact chunk of the intended zone. In that frame `r29` is the output buffer, `r26`
+   the stream index, and `r1+0x50` holds the bytes **written** (`0x28` for chunk 0, `0x7FC0`
+   for full chunks) - it is an out-param, not remaining space.
+
+So compression, Salsa20, the hash chain, name seeding, chunk framing and the game's own
+decoder all agree.
+
+## Zone growth and pointer relocation (implemented)
+
+`reloc.py` grows an asset inside a zone and fixes every affected pointer. Three findings
+made it work.
+
+**1. The pointer set is measured, not derived.** Rather than reversing ~60 asset structs to
+locate pointer fields, the fields are captured from a live load by hooking the loader's own
+`DB_ConvertOffsetToPointer` / `DB_ConvertOffsetToAlias`, together with the stream-to-guest
+map from `DB_LoadXFileData` (`0x822AD610`) and `DB_LoadXFileDataNullTerminated`
+(`0x822AD760`). That is ground truth by construction. Both readers are needed: string reads
+go through the NUL-terminated variant, and without it ~82 KB of the stream is unmapped and
+some pointer fields cannot be located.
+
+**2. Resolution must be temporal, not positional.** XBlock 0 is a push/pop scratch block
+whose addresses are rewritten many times during a load - one field there was observed
+holding five different encoded pointers. Resolving a field by address alone attributes it to
+the wrong write, and silently mis-attributes block-0 addresses to neighbouring block-5
+segments. Replaying the capture in order and resolving each conversion against the read that
+most recently wrote that address takes coverage to **11,731 / 11,731 pointers** and
+**7,295,715 / 7,295,715 stream bytes**.
+
+Within a block, stream order and block offset were verified monotonic (0 violations across
+5,938 block-5 read segments), so "insert at stream offset P" does mean "shift every block-5
+allocation past that point".
+
+**3. The insertion size must be a multiple of 4096.** The loader pads each allocation to an
+alignment boundary, so the shift later allocations experience is *not* the raw byte delta.
+Measured directly: growing a payload by 4183 bytes moved later block-5 allocations by
+exactly **4096** - 87 bytes less. Relocating pointers by the raw 4183 therefore left every
+one of them 87 bytes long, which crashed material loading
+(`Load_MaterialTechniqueSet -> Load_BindMaterialPassShaders` dereferencing ASCII).
+Rounding the delta up to a multiple of 4096 and zero-padding the payload makes
+`shift == delta` exactly, for any power-of-two alignment that divides 4096, with no
+alignment probing needed.
+
+Result on `patch_zm.ff`, growing `maps/mp/gametypes_zm/_callbacksetup.gsc` from 5,746 to
+13,938 bytes (raw +4,183 padded to +8,192): **129 pointers relocated, 0 unresolved**, and
+`+devmap zm_prototype` reaches gameplay with `g_copyInfoCount = 1` and 0 null slots,
+matching stock exactly.
+
+## ScriptParseTree payloads are inline and editable (resolved)
+
+Another previous unknown. `embedded_scripts.json` already records everything needed:
+`payload_offset`, `payload_size` and `zone_length_field_offset`. The asset header is the same
+shape as RawFile:
+
+```
+FF FF FF FF | be32 len | FF FF FF FF | name NUL | payload
+```
+
+For RawFile string buffers `len` **excludes** the terminating NUL. The stream is consumed
+sequentially and an allocation eats exactly `len` bytes, so the length field and the number
+of bytes written must always agree.
+
+Because a compiled GSC blob carries its own internal sizes, a payload may be **zero-padded**
+up to the original length and the trailing zeros are never read. Combined with gsc-tool
+producing slightly smaller output than Treyarch's compiler, many edits fit with no zone
+growth at all. Measured slack for `patch_zm.ff` (`gsc_slack.py`):
+
+| script | original | recompiled | slack |
+| --- | --- | --- | --- |
+| `maps/mp/_createfx.gsc` | 47,458 | 39,014 | +8,444 |
+| `maps/mp/zombies/_zm_utility.gsc` | 69,331 | 64,815 | +4,516 |
+| `maps/mp/zombies/_zm.gsc` | 101,413 | 98,445 | +2,968 |
+| `maps/mp/gametypes_zm/_callbacksetup.gsc` | 5,746 | 5,346 | +400 |
+
+A stock-for-stock recompile of `_callbacksetup.gsc`, zero-padded back to 5,746 bytes, loads
+and runs: the player connects and spawns, and that path goes straight through
+`codecallback_playerconnect`. So gsc-tool output is engine-compatible on Xbox 360 T6.
+
+## Status of the GSC mod-menu example
+
+`menu_body.gsc` plus `build_menu.py` compile a small mod menu into
+`maps/mp/gametypes_zm/_callbacksetup.gsc`, threading `mm_main()` from
+`codecallback_playerconnect`, and rebuild `patch_zm.ff` through the relocator.
+
+Verified: the grown zone loads, the zone-health canary matches stock exactly, and the map
+reaches gameplay with players connecting and spawning through the modified script (two
+spawns observed over a 130 s run, no crash).
+
+Not yet verified: the menu panel itself has not been photographed on screen. The HUD elements
+are created with `hidewheninmenu = 1`, so they are deliberately hidden while the pause menu
+is up, and driving the open combo (aim + knife) through synthetic input needs the game window
+focused from launch - otherwise the title auto-pauses on focus change and the panel stays
+hidden by design. Treat the menu's on-screen behaviour as untested.
+
+Builtins used by the menu were each confirmed present in the retail T6 string table:
+`adsbuttonpressed`, `meleebuttonpressed`, `actionslotonebuttonpressed`,
+`actionslottwobuttonpressed`, `usebuttonpressed`, `newclienthudelem`, `setshader`, `settext`,
+`enableinvulnerability`, `disableinvulnerability`, `setweaponammoclip`, `givemaxammo`,
+`playerlinktoabsolute`, `unlink`, `getnormalizedmovement`, `getplayerangles`,
+`anglestoforward`, `anglestoright`. Note `noclip` exists only as a cvar/command name, not as
+a GSC builtin, which is why no-clip is implemented by linking the player to a script_origin
+and moving it.
