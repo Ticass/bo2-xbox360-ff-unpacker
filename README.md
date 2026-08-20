@@ -463,18 +463,88 @@ relocator, and rewrites the length field:
 
 ```bash
 python build_menu.py
-#   payload: 5746 -> 13938 bytes (raw delta +4183, padded to +8192 for alignment)
-#   pointers: 129 relocated, 11602 untouched, 0 not written from stream, 0 UNRESOLVED
-#   header: stream 7295675 -> 7303867, XBlock[5] 7286801 -> 7294993
 python xbox360_ff_unpacker.py --repack patch_zm_mod_scan --no-recompile --out patch_zm.ff
 ```
 
-`menu_body.gsc` is a small menu - god mode, no clip, infinite ammo - opened with aim + knife,
-navigated with the d-pad, toggled with use.
+`menu_body.gsc` ships **Cry's Recomp Menu**: eight tabs (Player, Weapons, Points, Perks,
+Fun, Game, Map, Settings) covering god mode, no clip, infinite ammo/points, all perks,
+Pack-A-Punch, powerup drops, round skipping, opening every door, and disabling the
+out-of-bounds death barriers. Aim + knife opens it, d-pad up/down moves, d-pad left/right
+switches tab, use selects.
 
 **Status: confirmed working in game.** The grown zone loads, the zone-health canary matches
-stock exactly, the map reaches gameplay, and the menu opens on screen with aim + knife.
+stock exactly, and the map reaches gameplay with the menu on screen.
 
 One gotcha when testing: the HUD elements set `hidewheninmenu = 1`, so the panel is hidden
 while the pause menu is up. If the game window was never focused it will have auto-paused, so
 focus it from launch rather than pressing Escape to dismiss the pause menu.
+
+A few things the menu leans on that are worth knowing if you write your own:
+
+- `_callbacksetup.gsc` only includes `_hostmigration`, `_globallogic*`, `maps/mp/_audio`
+  and `maps/mp/_utility`. Anything from `common_scripts/utility` or `maps/mp/zombies/*`
+  has to be **fully qualified** or the import will not resolve.
+- Link an entity to the player with a `script_model` wearing `tag_origin` (precached by
+  `_globallogic::init` on every ZM map), not a bare `script_origin`. Zombies also runs near
+  the entity cap, so check the result of `spawn()` -- a raw spawn can hand back `undefined`,
+  after which the thread dies silently.
+- To end a round, empty `level.zombie_total` and kill the live zombies. Do **not** set the
+  `end_round_wait` flag: `_zm.gsc` initialises it and never clears it again, so every later
+  round would end instantly too.
+- To open a door or debris for free, send it `notify( "trigger", player, 1 )`. Both
+  `door_buy` and `debris_think` read that second argument as a forced purchase.
+
+## Checking a script links before you build
+
+Rebuilding a zone and launching the game to discover a typo is a slow loop. `gsc_link.py`
+simulates BO2's own GSC linker, and `linkcheck.py` is the CLI over it:
+
+```bash
+python linkcheck.py compiled/t6/_callbacksetup.gsc patch_zm_ff_scan
+```
+
+It reports two things:
+
+1. **Qualified import problems.** A call like `maps\mp\zombies\_zm_perks::give_perk` has to
+   resolve against a script that is actually in the loaded zone set, and the export's
+   parameter count has to be at least as large as the call site's. This must come out at
+   zero.
+2. **Names that must be engine builtins.** Unqualified calls resolve against the script's own
+   exports first; whatever is left has to be a builtin. Builtins live in the executable, not
+   in any script, so the tool can only list them for you to verify.
+
+For that second list, check the name against the builtin-name table in the XEX -- searching
+a disassembler database for the raw ASCII bytes of the name is enough. Do not rule a name
+out because it does not appear in the shipped scripts: `actionslotthreebuttonpressed`,
+`jumpbuttonpressed` and `stancebuttonpressed` are all real builtins that appear in none of
+T6's 148 shipped server scripts.
+
+`gsc_exports.py` is the smaller piece underneath, listing just the exported function names
+of a compiled payload.
+
+### In the app
+
+The check runs automatically. Any GSC/CSC you edit under `scripts_src/` is link-checked
+against the zone it came from as part of repack, and anything your edit *added* that
+cannot be resolved is written to the log and counted in the result summary.
+
+It never blocks the build. A warning that turns out to be a cross-zone call is a
+nuisance; refusing to build over one would be worse. But a `.ff` that produces link
+warnings is a `.ff` whose map is likely to refuse to load, so treat them as errors unless
+you know the target lives in another zone.
+
+Comparing against the stock payload rather than checking absolutely is what keeps
+legitimate cross-zone calls -- a patch zone's `_callbacksetup` calling into `common_zm` --
+from drowning the report in false positives.
+
+
+## Stubbing missing imports
+
+A patch zone does not always carry every script its own code calls. `build_stubs.py` and
+`patch_scripts.py` walk the unresolved set, generate no-op stubs with the right arity, and
+splice them into a script that *is* present, so the link completes instead of the map
+refusing to load. `build_patch_zm.py` is the full worked example: it rebuilds one zone from
+pristine in a single pass, applying size-neutral table edits, recompiled scripts, the stubs
+and the mod menu together, so every growing asset goes through **one** `relocate_multi`
+call. Applying growths one at a time against an already-grown zone would look up pointer
+fields at stale offsets.
