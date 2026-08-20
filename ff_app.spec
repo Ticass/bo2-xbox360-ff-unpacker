@@ -5,7 +5,7 @@ from pathlib import Path
 root = Path(SPECPATH)
 
 BRAND = "crybaby's repacker"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 a = Analysis(
     [str(root / "ff_app.py")],

@@ -27,12 +27,16 @@ from xbox360_ff_unpacker import (
 
 
 BRAND = "crybaby's repacker"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 APP_NAME = f"{BRAND} - BO2 Xbox 360 FastFile Unpacker"
 CONFIG_PATH = Path.home() / "AppData" / "Roaming" / "BO2FastFileUnpacker" / "config.json"
 WM_DROPFILES = 0x0233
 GWLP_WNDPROC = -4
 ENABLE_EXPERIMENTAL_WINDOW_DROP = False
+REPACK_FORMATS = {
+    "Dev loader / hardware — TAffu100, raw DEFLATE, 0sig": "deflate",
+    "Recomp legacy — TAffx100, encrypted XMem/LZX": "lzx",
+}
 
 
 def app_root() -> Path:
@@ -49,6 +53,51 @@ def bundled_root() -> Path:
 
 def default_lzx_helper() -> Path:
     return bundled_root() / "_tools" / "xmem_lzx_decompress.exe"
+
+
+def run_frozen_linker_self_test() -> int:
+    """Exercise the packaged TAffu100 linker without opening the GUI."""
+    import tempfile
+    import zlib
+
+    with tempfile.TemporaryDirectory(prefix="crybaby_repacker_selftest_") as temp_name:
+        root = Path(temp_name)
+        source = root / "selftest"
+        source.mkdir()
+        zone = bytes((index * 37 + 11) & 0xFF for index in range(0x10028))
+        (source / "zone_decompressed.dat").write_bytes(zone)
+
+        header = bytearray(0x138)
+        header[0:8] = b"TAffx100"
+        header[0x08:0x0C] = (0x92).to_bytes(4, "big")
+        header[0x0C:0x10] = b"PHEE"
+        header[0x10:0x14] = b"Bs71"
+        header[0x18:0x20] = b"selftest"
+        header[0x38:0x138] = b"\xA5" * 0x100
+        (source / "ff_header.bin").write_bytes(header)
+
+        output = root / "selftest.ff"
+        result = repack_fastfile_from_folder(
+            source, output, recompile=False, compression="deflate"
+        )
+        linked = output.read_bytes()
+        if result.get("magic") != "TAffu100" or linked[0:8] != b"TAffu100":
+            raise RuntimeError("self-test linker did not emit TAffu100")
+        if any(linked[0x38:0x138]):
+            raise RuntimeError("self-test linker did not zero the signature slot")
+
+        offset = 0x138
+        rebuilt = bytearray()
+        while offset + 4 <= len(linked):
+            size = int.from_bytes(linked[offset:offset + 4], "big")
+            offset += 4
+            if size == 0:
+                break
+            rebuilt += zlib.decompress(linked[offset:offset + size], wbits=-15)
+            offset += size
+        if bytes(rebuilt) != zone:
+            raise RuntimeError("self-test raw-DEFLATE records did not round-trip")
+    return 0
 
 
 def load_config() -> dict:
@@ -284,6 +333,12 @@ class FastFileApp:
         self.root = root
         self.config = load_config()
         self.game_folder = tk.StringVar(value=self.config.get("game_folder", ""))
+        configured_compression = self.config.get("repack_compression", "deflate")
+        selected_format = next(
+            (label for label, compression in REPACK_FORMATS.items() if compression == configured_compression),
+            next(iter(REPACK_FORMATS)),
+        )
+        self.repack_format = tk.StringVar(value=selected_format)
         self.status_text = tk.StringVar(value="Select your game folder, then choose .ff files or drag them onto the executable.")
         self.progress_text = tk.StringVar(value="")
         self.progress_value = tk.DoubleVar(value=0)
@@ -347,6 +402,19 @@ class FastFileApp:
         self.folder_entry = ttk.Entry(folder_box, textvariable=self.game_folder)
         self.folder_entry.pack(side=LEFT, fill=X, expand=True)
         ttk.Button(folder_box, text="Save", command=self.save_game_folder_from_entry).pack(side=RIGHT, padx=(8, 0))
+
+        format_row = ttk.Frame(outer)
+        format_row.pack(fill=X, pady=(0, 14))
+        ttk.Label(format_row, text="Repack format", style="Muted.TLabel").pack(side=LEFT)
+        format_picker = ttk.Combobox(
+            format_row,
+            textvariable=self.repack_format,
+            values=tuple(REPACK_FORMATS),
+            state="readonly",
+            width=58,
+        )
+        format_picker.pack(side=RIGHT)
+        format_picker.bind("<<ComboboxSelected>>", lambda _event: self.save_repack_format())
 
         drop = ttk.Frame(outer, style="Panel.TFrame", padding=28)
         drop.pack(fill=X)
@@ -430,6 +498,18 @@ class FastFileApp:
         count = len(list(path.glob("*.ff")))
         self.status_text.set(f"Game folder saved. Found {count} .ff files.")
 
+    def selected_repack_compression(self) -> str:
+        return REPACK_FORMATS.get(self.repack_format.get(), "deflate")
+
+    def save_repack_format(self) -> None:
+        compression = self.selected_repack_compression()
+        self.config["repack_compression"] = compression
+        save_config(self.config)
+        if compression == "deflate":
+            self.status_text.set("Repack format: dev-loader TAffu100 with plaintext raw DEFLATE and zero signature.")
+        else:
+            self.status_text.set("Repack format: legacy TAffx100 with Salsa20-encrypted XMem/LZX chunks.")
+
     def choose_files(self) -> None:
         initial = self.game_folder.get() if Path(self.game_folder.get()).exists() else str(Path.home())
         names = filedialog.askopenfilenames(
@@ -491,10 +571,13 @@ class FastFileApp:
         if self.worker and self.worker.is_alive():
             messagebox.showinfo(APP_NAME, "A job is already running. Try again once it finishes.")
             return
-        self.worker = threading.Thread(target=self.repack_run, args=(sources,), daemon=True)
+        compression = self.selected_repack_compression()
+        self.config["repack_compression"] = compression
+        save_config(self.config)
+        self.worker = threading.Thread(target=self.repack_run, args=(sources, compression), daemon=True)
         self.worker.start()
 
-    def repack_run(self, sources: list[Path]) -> None:
+    def repack_run(self, sources: list[Path], compression: str) -> None:
         total = len(sources)
         for index, path in enumerate(sources, 1):
             self.work_queue.put(("repack_start", path, index, total))
@@ -503,10 +586,14 @@ class FastFileApp:
                     # Recompile edited scripts_src/ (and Lua) then rebuild + repack.
                     out_ff = path.with_suffix(".ff")
                     result = repack_fastfile_from_folder(
-                        path, out_ff, log=lambda msg: self.work_queue.put(("log", msg)), recompile=True
+                        path, out_ff, log=lambda msg: self.work_queue.put(("log", msg)),
+                        recompile=True, compression=compression
                     )
                 else:
-                    result = repack_fastfile_from_zip(path, None, log=lambda msg: self.work_queue.put(("log", msg)))
+                    result = repack_fastfile_from_zip(
+                        path, None, log=lambda msg: self.work_queue.put(("log", msg)),
+                        compression=compression
+                    )
                 self.work_queue.put(("repack_done", path, result, index, total))
             except Exception as exc:  # noqa: BLE001 - surface a friendly error, keep going.
                 self.work_queue.put(("repack_error", path, str(exc), traceback.format_exc(), index, total))
@@ -653,7 +740,8 @@ class FastFileApp:
                     )
             self.status_text.set(
                 f"Repacked {path.name} -> {Path(result['output']).name} "
-                f"({result.get('chunks', 0)} chunks, {result.get('ff_size', 0)} bytes).{recompile_note}"
+                f"({result.get('chunks', 0)} chunks, {result.get('ff_size', 0)} bytes, "
+                f"{result.get('magic', 'unknown')}/{result.get('compression', 'unknown')}).{recompile_note}"
             )
         elif kind == "repack_error":
             _, path, error, details, index, total = event
@@ -718,6 +806,8 @@ class FastFileApp:
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
+    if "--self-test" in argv:
+        return run_frozen_linker_self_test()
     startup_files = [Path(arg) for arg in argv if Path(arg).suffix.lower() == ".ff"]
     startup_zips = [Path(arg) for arg in argv if Path(arg).suffix.lower() == ".zip"]
     root = tk.Tk()

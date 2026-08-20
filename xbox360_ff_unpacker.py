@@ -71,10 +71,24 @@ BO2_X360_SALSA20_KEY = bytes(
     ]
 )
 
-KNOWN_MAGIC = {b"TAff0100", b"TAffx100"}
+# The magic selects BOTH the compressor and whether the RSA zone signature is verified.
+# Measured in the Xbox 360 build: ValidateFileHeader sets an auth flag and an LZX flag
+# from it, DB_LoadXFile passes the auth flag to DB_AuthLoad_Init, and DB_AuthLoad_End
+# returns immediately when that flag is false -- so the signature is never checked and
+# its booby-trapped failure path (g_copyInfoCount += 2048) never fires.
+KNOWN_MAGIC = {b"TAff0100", b"TAffx100", b"TAffu100", b"TAsvu100"}
 MAGIC_COMPRESSION = {
     b"TAff0100": "deflate",
     b"TAffx100": "lzx",
+    b"TAffu100": "deflate",
+    b"TAsvu100": "deflate",
+}
+#: Magics whose fastfiles are authenticated (signature verified on load).
+MAGIC_AUTHENTICATED = {
+    b"TAff0100": True,
+    b"TAffx100": True,
+    b"TAffu100": False,
+    b"TAsvu100": False,
 }
 SCRIPT_DIR = Path(__file__).resolve().parent
 AUTH_HEADER_OFFSET = 0x0C
@@ -2005,7 +2019,12 @@ class FastFileScanner:
                 break
 
             encrypted = payload[offset : offset + chunk_size]
-            decrypted, iv, digest = decryptor.decrypt(stream, encrypted)
+            if MAGIC_AUTHENTICATED.get(self.data[0:8], True):
+                decrypted, iv, digest = decryptor.decrypt(stream, encrypted)
+            else:
+                decrypted = encrypted
+                iv = b""
+                digest = hashlib.sha1(decrypted).digest()
             lzx_headers = parse_xmem_lzx_headers(decrypted) if self.metadata["header"]["compression_from_magic"] == "lzx" else None
             if lzx_headers:
                 total_decrypted_lzx_dst_prefix += sum(block["dst_size"] for block in lzx_headers["blocks"])
@@ -2098,7 +2117,12 @@ class FastFileScanner:
             if chunk_size == 0 or chunk_size > XCHUNK_SIZE or offset + chunk_size > len(payload):
                 break
             encrypted = payload[offset : offset + chunk_size]
-            decrypted, iv, digest = decryptor.decrypt(stream, encrypted)
+            if MAGIC_AUTHENTICATED.get(self.data[0:8], True):
+                decrypted, iv, digest = decryptor.decrypt(stream, encrypted)
+            else:
+                decrypted = encrypted
+                iv = b""
+                digest = hashlib.sha1(decrypted).digest()
             path = xchunk_dir / f"{index:06d}_stream{stream}_file{size_field_offset:08x}.xmem"
             path.write_bytes(decrypted)
             dumps.append(
@@ -2192,7 +2216,12 @@ class FastFileScanner:
                     raise ValueError(f"xchunk at 0x{size_field_offset:08X} extends past EOF")
 
                 encrypted = payload[offset : offset + chunk_size]
-                decrypted, iv, digest = decryptor.decrypt(stream, encrypted)
+                if MAGIC_AUTHENTICATED.get(self.data[0:8], True):
+                    decrypted, iv, digest = decryptor.decrypt(stream, encrypted)
+                else:
+                    decrypted = encrypted
+                    iv = b""
+                    digest = hashlib.sha1(decrypted).digest()
                 dec_path = chunks_dir / f"{index:06d}_stream{stream}_file{size_field_offset:08x}.bin"
                 if compression == "lzx":
                     xmem_path = temp_dir / f"{index:06d}.xmem"
@@ -2417,6 +2446,43 @@ def fastfile_name_from_header(header: bytes, fallback: str) -> str:
     return raw_name.decode("ascii", errors="replace")[:31]
 
 
+def deflate_compress_zone_records(
+    zone_path: Path,
+    chunk_plan: list[int],
+    log=None,
+) -> list[bytes]:
+    """Compress a decompressed zone into per-chunk raw-deflate records.
+
+    The game inflates each chunk with ``inflateInit2(&zs, -15, ...)`` and asserts the
+    result is ``Z_STREAM_END`` with fewer than 4 input bytes left over, so every chunk
+    has to be a *complete* raw deflate stream (no zlib header, final block set) covering
+    exactly that chunk's bytes. ``compressobj(..., -15)`` plus ``flush()`` gives that.
+    """
+    import zlib
+
+    data = zone_path.read_bytes()
+    records: list[bytes] = []
+    offset = 0
+    for size in chunk_plan:
+        raw = data[offset:offset + size]
+        offset += size
+        compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+        blob = compressor.compress(raw) + compressor.flush()
+        # The reader rejects a chunk whose encrypted size is >= XCHUNK_SIZE, and
+        # incompressible data can inflate slightly, so refuse here rather than emit a
+        # fastfile that fails late.
+        if len(blob) >= XCHUNK_SIZE:
+            raise ValueError(
+                f"deflate chunk at offset {offset - size} compressed to {len(blob)} bytes, "
+                f"which is >= XCHUNK_SIZE (0x{XCHUNK_SIZE:X})"
+            )
+        records.append(blob)
+    if log:
+        total = sum(len(r) for r in records)
+        log(f"deflate: {len(records)} chunk(s), {offset} -> {total} bytes")
+    return records
+
+
 def xmem_compress_zone_records(
     zone_path: Path,
     chunk_size: int,
@@ -2480,19 +2546,21 @@ def xmem_compress_zone_records(
     return records
 
 
-def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile: bool = True) -> dict[str, Any]:
+def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile: bool = True,
+                                compression: str = "deflate") -> dict[str, Any]:
     """Rebuild a FastFile from an unpacked folder.
 
     The folder must contain `zone_decompressed.dat` (the full decompressed zone).
     When `recompile` is set and a `zone_patch_manifest.json` is present, edited
     sources under `scripts_src/` (GSC/CSC via gsc-tool) and `ui_lua_readable/`
     (Lua via lua_tool) are recompiled and spliced back into the zone first (see
-    `zone_rebuild.recompile_and_rebuild`). Output is a `TAffx100` (LZX)
-    FastFile: the zone is re-chunked, XMem/LZX-compressed, and Salsa20-encrypted with the
-    same name-seeded IV chain the game regenerates. The original 0x138-byte header
-    (`ff_header.bin`) is reused when present so the fastfile name and 256-byte
-    signature blob are preserved. The magic is forced to `TAffx100` because we emit
-    LZX chunks through Microsoft's XNA `XnaNative.dll` XMem encoder.
+    `zone_rebuild.recompile_and_rebuild`). The output format is selected by
+    ``compression`` and the zone is re-chunked using the Xbox 360 split. The default ``deflate``
+    mode emits the real-hardware/dev-loader ``TAffu100`` layout: a zero-filled signature
+    slot followed by plaintext raw-DEFLATE records. The legacy ``lzx`` mode emits
+    ``TAffx100`` records compressed through Microsoft's XNA ``XnaNative.dll`` XMem
+    encoder and Salsa20-encrypted with the name-seeded IV chain. The original 0x138-byte
+    header (``ff_header.bin``) is reused when present so the fastfile name is preserved.
     """
 
     def _log(message: str) -> None:
@@ -2543,8 +2611,17 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
         header[0x10:0x14] = b"Bs71"
         _log("ff_header.bin not found; synthesizing a minimal header (signature will be zeroed).")
 
-    # We emit XMem/LZX chunks, so the magic must select the LZX loader path.
-    header[0:8] = b"TAffx100"
+    # The magic has to agree with what we are about to emit. TAffu100 selects the raw
+    # deflate loader path AND turns off signature verification, which is what a repacked
+    # zone needs -- its signature can never be valid again. The unsigned layout still
+    # contains the ordinary 0x100-byte signature field immediately before the payload;
+    # real-hardware files have that field zero-filled, not removed or inserted elsewhere.
+    if compression not in ("lzx", "deflate"):
+        raise ValueError(f"unknown compression {compression!r}; expected 'lzx' or 'deflate'")
+    magic = b"TAffx100" if compression == "lzx" else b"TAffu100"
+    header[0:8] = magic
+    if compression == "deflate":
+        header[SIGNATURE_OFFSET:PAYLOAD_OFFSET] = b"\x00" * SIGNATURE_SIZE
     zone_name = fastfile_name_from_header(header, stem)
     name_bytes = zone_name.encode("ascii", "replace")[:31]
     header[0x18 : 0x18 + 32] = name_bytes + b"\x00" * (32 - len(name_bytes))
@@ -2552,18 +2629,20 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
     encryptor = OatSalsa20ChunkDecryptor(zone_name)
     out = bytearray(header)
     chunk_plan = build_xbox360_lzx_chunk_plan(len(zone))
-    _log(f"Using Xbox 360 LZX chunk split: first 0x{XFILE_HEADER_CHUNK_SIZE:X}, then 0x{XCHUNK_MAX_WRITE_SIZE:X} ({len(chunk_plan)} chunks).")
+    _log(f"Using Xbox 360 chunk split: first 0x{XFILE_HEADER_CHUNK_SIZE:X}, then 0x{XCHUNK_MAX_WRITE_SIZE:X} ({len(chunk_plan)} chunks).")
 
-    compressed_chunks = xmem_compress_zone_records(
-        zone_path,
-        XCHUNK_MAX_WRITE_SIZE,
-        first_chunk_size=XFILE_HEADER_CHUNK_SIZE,
-        chunk_plan=chunk_plan,
-        log=log,
-    )
-    # Reproduce the Xbox 360 LZX chunk stream exactly: first the 0x28-byte XFile
-    # header chunk, then 0x7FC0-byte chunks until EOF. Each chunk is
-    # XMem/LZX-compressed then Salsa20-encrypted and written as
+    if compression == "deflate":
+        compressed_chunks = deflate_compress_zone_records(zone_path, chunk_plan, log=log)
+    else:
+        compressed_chunks = xmem_compress_zone_records(
+            zone_path,
+            XCHUNK_MAX_WRITE_SIZE,
+            first_chunk_size=XFILE_HEADER_CHUNK_SIZE,
+            chunk_plan=chunk_plan,
+            log=log,
+        )
+    # Reproduce the Xbox 360 chunk stream exactly: first the 0x28-byte XFile
+    # header chunk, then 0x7FC0-byte chunks until EOF. Each chunk is written as
     # [be32 size][data] cycling XCHUNK_STREAM_COUNT streams, and the 4-byte size
     # header is never allowed to straddle a VANILLA_BUFFER_SIZE window (measured
     # from the start of the file, so the offset starts at the header length).
@@ -2574,15 +2653,20 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
     stream = 0
     chunk_count = 0
     for raw in compressed_chunks:
-        ciphertext, _iv, _digest = encryptor.encrypt(stream, raw)
-        chunk_size = len(ciphertext)
+        if compression == "deflate":
+            # TAffu100 real-hardware files carry plaintext raw-DEFLATE records.
+            # Applying the retail Salsa20 chain here makes inflate fail immediately.
+            stored = raw
+        else:
+            stored, _iv, _digest = encryptor.encrypt(stream, raw)
+        chunk_size = len(stored)
         if chunk_size >= XCHUNK_SIZE:
             raise ValueError(f"compressed chunk {chunk_count} is >= XCHUNK_SIZE: {chunk_size} bytes")
         if vanilla_offset + 4 > VANILLA_BUFFER_SIZE:
             out += b"\x00" * (VANILLA_BUFFER_SIZE - vanilla_offset)
             vanilla_offset = 0
         out += chunk_size.to_bytes(4, "big")
-        out += ciphertext
+        out += stored
         vanilla_offset = (vanilla_offset + 4 + chunk_size) % VANILLA_BUFFER_SIZE
         stream = (stream + 1) % XCHUNK_STREAM_COUNT
         chunk_count += 1
@@ -2594,18 +2678,25 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
         out += b"\x00" * (FILE_SUFFIX_ZERO_ALIGN - (len(out) % FILE_SUFFIX_ZERO_ALIGN))
 
     out_ff.write_bytes(out)
-    _log(f"Repacked {chunk_count} chunk(s) -> {out_ff.name} ({len(out)} bytes)")
+    _log(
+        f"Repacked {chunk_count} chunk(s) -> {out_ff.name} ({len(out)} bytes, "
+        f"{magic.decode('ascii')}, {compression}"
+        f"{'' if MAGIC_AUTHENTICATED.get(magic, True) else ', signature not checked on load'})"
+    )
     return {
         "output": str(out_ff),
         "chunks": chunk_count,
         "zone_size": len(zone),
         "ff_size": len(out),
         "used_original_header": header_path.exists(),
+        "compression": compression,
+        "magic": magic.decode("ascii"),
+        "authenticated": MAGIC_AUTHENTICATED.get(magic, True),
         "recompile": recompile_result,
     }
 
 
-def repack_fastfile_from_zip(zip_path: Path, out_ff: Path | None = None, log=None) -> dict[str, Any]:
+def repack_fastfile_from_zip(zip_path: Path, out_ff: Path | None = None, log=None, compression: str = "deflate") -> dict[str, Any]:
     """Repack a `<name>.zip` of an unpacked folder into `<name>.ff`.
 
     The archive is expected to contain the unpacked folder (the one holding
@@ -2634,7 +2725,7 @@ def repack_fastfile_from_zip(zip_path: Path, out_ff: Path | None = None, log=Non
         folder = next((c for c in candidates if c.name == stem), None)
         if folder is None:
             folder = min(candidates, key=lambda p: len(p.parts))
-        return repack_fastfile_from_folder(folder, out_ff, log=log)
+        return repack_fastfile_from_folder(folder, out_ff, log=log, compression=compression)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2659,6 +2750,12 @@ def main(argv: list[str] | None = None) -> int:
         "--no-recompile",
         action="store_true",
         help="During --repack, do NOT recompile edited sources; repack the zone as-is",
+    )
+    parser.add_argument(
+        "--compression",
+        choices=("deflate", "lzx"),
+        default="deflate",
+        help="Repack codec/layout (default: deflate = plaintext TAffu100 for the dev loader)",
     )
     parser.add_argument("-o", "--out", type=Path, default=None, help="Output directory (unpack) or output .ff (repack)")
     parser.add_argument("--metadata", type=Path, default=None, help="Metadata JSON path")
@@ -2705,10 +2802,13 @@ def main(argv: list[str] | None = None) -> int:
             if source.is_dir():
                 out_ff = args.out or source.with_suffix(".ff")
                 result = repack_fastfile_from_folder(
-                    source, out_ff, log=lambda m: print(m, file=sys.stderr), recompile=not args.no_recompile
+                    source, out_ff, log=lambda m: print(m, file=sys.stderr),
+                    recompile=not args.no_recompile, compression=args.compression
                 )
             else:
-                result = repack_fastfile_from_zip(source, args.out, log=lambda m: print(m, file=sys.stderr))
+                result = repack_fastfile_from_zip(
+                    source, args.out, log=lambda m: print(m, file=sys.stderr), compression=args.compression
+                )
         except (OSError, ValueError, FileNotFoundError) as exc:
             print(f"error: repack failed: {exc}", file=sys.stderr)
             return 1

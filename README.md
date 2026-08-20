@@ -57,20 +57,21 @@ The app has two options:
   `zone_decompressed.dat`; keep `ff_header.bin` to preserve the original name and
   signature blob).
 
-Repack splits `zone_decompressed.dat` exactly like Xbox 360 LZX fastfiles: the
-first block is the `0x28` byte XFile header, and every following block is
-`0x7FC0` bytes except the final tail. It XMem/LZX-compresses each block through
-the bundled XNA-backed helper, then Salsa20-encrypts it with the same
-name-seeded IV chain the game regenerates. The output uses the `TAffx100` (LZX)
-format. Verified: repack -> unpack round-trips the zone byte-for-byte with zero
-chunk errors.
+The app exposes two repack formats. The default is the dev-loader/real-hardware
+`TAffu100` layout: the existing 256-byte signature slot at `0x38..0x137` is
+zero-filled and each big-endian length-prefixed chunk contains a plaintext raw
+DEFLATE stream. The legacy recomp option emits `TAffx100`, XMem/LZX-compresses
+each chunk through the bundled XNA-backed helper, then Salsa20-encrypts it with
+the name-seeded IV chain. Both modes split the zone into a first `0x28`-byte
+XFile-header chunk followed by `0x7FC0`-byte chunks and round-trip through the
+unpacker byte-for-byte.
 
 CLI equivalents:
 
 ```powershell
 python .\xbox360_ff_unpacker.py C:\GAMES\merged2\common_zm.ff --decompress-zone --allow-partial-zone
-python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm.zip
-python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm --out C:\path\to\common_zm.ff
+python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm.zip --compression deflate
+python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm --compression lzx --out C:\path\to\common_zm.ff
 ```
 
 ## Main tools
@@ -83,11 +84,13 @@ python .\xbox360_ff_unpacker.py --repack C:\path\to\common_zm --out C:\path\to\c
     name.
 - `xbox360_ff_unpacker.py`
   - Parses the clear fastfile header.
-  - Decrypts BO2 Xbox xchunks with the observed OpenAssetTools-compatible
-    Salsa20 stream setup.
+  - Reads authenticated BO2 Xbox xchunks through the observed
+    OpenAssetTools-compatible Salsa20 stream setup and unsigned chunks as plaintext.
   - Inflates `TAffx100` XMem/LZX chunks through `_tools/xmem_lzx_decompress.exe`.
-  - Inflates `TAff0100` chunks as raw deflate.
-  - Repacks as `TAffx100` through `_tools/xmem_compress.exe`.
+  - Inflates `TAff0100` encrypted raw-deflate chunks and `TAffu100` plaintext
+    raw-deflate chunks.
+  - Repacks as dev-loader `TAffu100`/raw-DEFLATE/0sig by default, or as legacy
+    `TAffx100` through `_tools/xmem_compress.exe` with `--compression lzx`.
   - Extracts high-confidence embedded compiled `.gsc`/`.csc` payloads.
   - Extracts high-confidence embedded compiled `.lua` UI payloads.
 - `script_inventory.py`
@@ -548,3 +551,12 @@ pristine in a single pass, applying size-neutral table edits, recompiled scripts
 and the mod menu together, so every growing asset goes through **one** `relocate_multi`
 call. Applying growths one at a time against an already-grown zone would look up pointer
 fields at stale offsets.
+
+## Credits
+
+- **Lil Poop** — information about the FastFile layout expected by the dev loader and
+  real hardware, including the in-place zero-signature field, raw-DEFLATE chunks, and
+  file alignment behavior that made the `TAffu100` linker path possible.
+- **OpenAssetTools contributors** — Xbox/Xenon T6 framing, compression, and decryption
+  research used by the authenticated LZX path.
+- **xensik** — `gsc-tool`, used for T6 GSC/CSC decompilation and recompilation.
