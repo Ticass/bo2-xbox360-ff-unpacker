@@ -18,7 +18,9 @@ a = Analysis(
         # before building; bundled so the frozen app can decompile/recompile scripts.
         (str(root / "_tools" / "gsc-tool" / "gsc-tool.exe"), "gsc-tool"),
     ],
-    hiddenimports=["gsc_tool", "zone_rebuild"],
+    # gsc_link is imported lazily inside zone_rebuild._link_check; name it here so a
+    # refactor cannot silently drop the link checker out of the frozen build.
+    hiddenimports=["gsc_tool", "zone_rebuild", "gsc_link"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
