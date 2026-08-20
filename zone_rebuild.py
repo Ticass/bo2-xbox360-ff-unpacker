@@ -277,6 +277,45 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _link_check(folder: Path, zone: bytes, asset: dict, new_object: bytes) -> list[str]:
+    """Link-check one recompiled GSC/CSC payload against the zone it belongs to.
+
+    BO2 resolves every import when the zone links, and a call that resolves to
+    nothing takes the whole map down with a script error at load. Compiling proves
+    the syntax, not the links, and the difference otherwise costs a full
+    rebuild-and-launch cycle to find.
+
+    This is a regression check on purpose. Scripts legitimately call into other
+    zones -- a patch zone's _callbacksetup calls into common_zm -- so an absolute
+    "does everything resolve inside this zone" test would be mostly false
+    positives. Diffing the edited payload against the stock one cancels those out:
+    only what the edit added is reported.
+
+    Never fatal. A warning that turns out to be a cross-zone call is a nuisance;
+    refusing to build over one would be worse.
+    """
+    try:
+        import gsc_link
+    except Exception:  # noqa: BLE001 - the check is optional, the repack is not
+        return []
+
+    try:
+        index = gsc_link.index_scripts([folder])
+        if not index:
+            return []
+        offset = asset.get("payload_offset")
+        length = asset.get("len_field_value")
+        if length is None:
+            length = asset.get("buffer_stream_len")
+        if offset is None or length is None:
+            return []
+        old_object = zone[offset:offset + length]
+        report = gsc_link.regression(old_object, new_object, index)
+        return gsc_link.describe(report, asset.get("name") or "")
+    except Exception as exc:  # noqa: BLE001
+        return ["link check skipped (%s)" % exc]
+
+
 def recompile_and_rebuild(
     folder: Path,
     log: Callable[[str], None] | None = None,
@@ -311,6 +350,7 @@ def recompile_and_rebuild(
     changed: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     skipped_unchanged = 0
+    link_warnings: list[str] = []
     gsc_exe = gsc_tool.find_gsc_tool()
 
     for asset in manifest.get("assets", []):
@@ -354,6 +394,15 @@ def recompile_and_rebuild(
         # followed by a single null terminator; the loader reads len + 1 bytes,
         # so the new buffer is object + 0x00 and the len field becomes |object|.
         new_buffer = compiled_object + b"\x00"
+
+        # Compiling is not linking. Report what this edit ADDED that cannot be
+        # resolved -- against the stock payload as the baseline -- before it ever
+        # reaches a .ff. See gsc_link.regression.
+        if recompiler == "gsc-tool":
+            for line in _link_check(folder, zone, asset, compiled_object):
+                link_warnings.append(line)
+                _log("WARNING: " + line)
+
         replacements[header_offset] = new_buffer
         changed.append(
             {
@@ -372,6 +421,7 @@ def recompile_and_rebuild(
             "skipped_unchanged": skipped_unchanged,
             "errors": errors,
             "rebuilt": False,
+            "link_warnings": [],
             "note": "No edited sources detected; zone unchanged.",
         }
 
@@ -407,6 +457,7 @@ def recompile_and_rebuild(
         "unresolved_pointers": info["unresolved_pointers"],
         "backup": str(backup),
         "changed_assets": changed,
+        "link_warnings": link_warnings,
     }
 
 

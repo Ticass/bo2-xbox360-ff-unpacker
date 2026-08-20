@@ -2518,6 +2518,14 @@ def repack_fastfile_from_folder(folder: Path, out_ff: Path, log=None, recompile:
                 )
             if recompile_result.get("errors"):
                 _log(f"WARNING: {len(recompile_result['errors'])} source(s) failed to recompile; see result.")
+            link_warnings = recompile_result.get("link_warnings") or []
+            if link_warnings:
+                # These build a .ff that the game will refuse to load, so they are
+                # worth shouting about even though the repack itself succeeded.
+                _log(
+                    f"WARNING: {len(link_warnings)} link problem(s) in the recompiled script(s). "
+                    "The .ff will build, but the map may fail to load."
+                )
         except Exception as exc:  # noqa: BLE001 - repack should still work from the raw zone
             recompile_result = {"status": "failed", "error": str(exc)}
             _log(f"WARNING: recompile step failed ({exc}); repacking the zone as-is.")

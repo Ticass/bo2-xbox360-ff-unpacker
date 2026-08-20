@@ -27,7 +27,7 @@ from xbox360_ff_unpacker import (
 
 
 BRAND = "crybaby's repacker"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_NAME = f"{BRAND} - BO2 Xbox 360 FastFile Unpacker"
 CONFIG_PATH = Path.home() / "AppData" / "Roaming" / "BO2FastFileUnpacker" / "config.json"
 WM_DROPFILES = 0x0233
@@ -645,6 +645,12 @@ class FastFileApp:
                     recompile_note = f" Recompiled {changed} edited source(s)."
                 if recompile.get("errors"):
                     recompile_note += f" {len(recompile['errors'])} failed to recompile."
+                link_warnings = recompile.get("link_warnings") or []
+                if link_warnings:
+                    recompile_note += (
+                        f" {len(link_warnings)} LINK WARNING(S) - the map may fail to load;"
+                        " see the log."
+                    )
             self.status_text.set(
                 f"Repacked {path.name} -> {Path(result['output']).name} "
                 f"({result.get('chunks', 0)} chunks, {result.get('ff_size', 0)} bytes).{recompile_note}"
