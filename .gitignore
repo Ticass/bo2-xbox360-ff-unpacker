@@ -55,3 +55,10 @@
 
 # Native helper build artifacts
 *.obj
+
+# Local investigation scratch (contains extracted game content)
+/_nacht_*/
+/_nacht_*.lua
+/_diagnose_*/
+/_build/
+/captures/*.tmp

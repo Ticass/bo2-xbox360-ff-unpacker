@@ -393,8 +393,42 @@ as `((block << 29) | offset) + 1` and resolved against the destination XBlock ba
 growing an allocation shifts every later allocation in that block and invalidates every
 encoded pointer past it. `reloc.py` handles that.
 
-It needs a captured pointer table, `zone_ptrs.bin`, recorded from one real load of the stock
-zone. The capture comes from hooking four loader functions in the running game:
+### Captures ship with the tool
+
+Recording a capture means hooking the running game, which most people cannot do, so the
+tables for the common Zombies patch zones are bundled under `captures/` and selected
+automatically. If your zone is one of them, a growing edit works with no setup at all —
+CLI and app alike.
+
+| Capture | Zone |
+| --- | --- |
+| `patch_zm.rfazio.zone_ptrs.bin` | rfazio retail `patch_zm.ff`, stock (7,295,715 B) |
+| `patch_zm.tu18-stock.zone_ptrs.bin` | TU18 `patch_zm.ff`, stock (9,280,490 B) |
+| `patch_zm.tu18-classicmaps.zone_ptrs.bin` | TU18 `patch_zm.ff` with the classic-map table port (9,288,463 B) |
+
+```bash
+python captures.py                              # list what ships
+python captures.py path/to/zone_decompressed.dat  # show which one fits, and how well
+```
+
+Selection is by content, never filename: zone md5 first, then zone size. A capture matched
+on size alone is verified field by field before it is used. Anything under 95% matching
+fields is treated as the wrong zone and ignored.
+
+A partial match is not automatically fatal, and the tool says so rather than guessing.
+Size-neutral edits — repointing a StringTable cell, say — change a few encoded values
+without moving any field. Those stale entries only matter if they sit inside the range your
+growth would shift, so that is exactly what gets checked: if any pointer the relocation has
+to move is stale, the rebuild refuses with `RelocationRequired` instead of writing a zone
+with a stale pointer in it.
+
+To use your own capture instead, drop it beside the zone as `zone_ptrs.bin`, or pass
+`--ptr-table`. Either takes precedence over the bundled set.
+
+### Recording your own
+
+A capture is `zone_ptrs.bin`, recorded from one real load of the zone you intend to edit.
+It comes from hooking four loader functions in the running game:
 
 | Address | Function | Recorded |
 | --- | --- | --- |

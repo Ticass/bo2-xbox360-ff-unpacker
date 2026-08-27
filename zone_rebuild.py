@@ -202,9 +202,11 @@ def splice_zone(
     if ptr_table is None or not Path(ptr_table).exists():
         raise RelocationRequired(
             f"{len(grown)} buffer(s) are larger than the originals, which shifts later "
-            "allocations and invalidates encoded zone pointers. That needs a captured "
-            f"pointer table ({PTR_TABLE_FILE}); see reloc.py for the capture format. "
-            "Without it, shrink the edit so it fits the original size instead."
+            "allocations and invalidates encoded zone pointers. That needs a pointer table "
+            "captured from a real load of this exact zone. None of the bundled captures "
+            "matched it -- run `python captures.py <zone_decompressed.dat>` to see what "
+            f"ships, drop your own next to the zone as {PTR_TABLE_FILE}, or shrink the edit "
+            "so it fits the original size and no relocation is needed."
         )
 
     import reloc
@@ -232,6 +234,26 @@ def splice_zone(
             say(f"{record.name}: {record.buffer_stream_len} -> {len(new_buffer)} bytes "
                 f"(raw {raw:+d}, padded to {delta:+d} for alignment), "
                 f"XBlock {block} from offset 0x{block_off + record.buffer_stream_len:X}")
+
+    # A capture records where the pointer fields are AND what they encoded. Size-neutral
+    # edits made since it was taken leave some fields holding a different value; those are
+    # harmless unless they sit inside a range this growth would shift, in which case the
+    # relocator would skip them and leave a stale pointer behind. Refuse instead.
+    import captures as _captures
+
+    matched, stale = _captures.validate(zone, zmap)
+    if stale:
+        say(f"pointer table: {stale} of {matched + stale} fields differ from the capture "
+            "(normal after size-neutral edits)")
+        risky = sum(_captures.stale_inside_range(zone, zmap, block, threshold)
+                    for _off, _delta, block, threshold in insertions)
+        if risky:
+            raise RelocationRequired(
+                f"{risky} pointer field(s) that this growth has to relocate hold a different "
+                "value than the capture recorded, so the zone has been edited since it was "
+                "taken. Relocating them would write stale pointers. Recapture against this "
+                "exact zone, or start from the zone the capture was made for."
+            )
 
     relocated, report = reloc.relocate_multi(zone, zmap, insertions, log=say)
     out = bytearray(relocated)
@@ -431,6 +453,16 @@ def recompile_and_rebuild(
             if candidate.exists():
                 ptr_table = candidate
                 break
+
+    if ptr_table is None:
+        # Otherwise match one of the bundled captures against the zone by content, so a
+        # growing edit works out of the box on the builds we ship a capture for.
+        import captures
+
+        match = captures.find_for_zone(zone)
+        if match is not None:
+            ptr_table = match.path
+            _log(f"pointer table: {match.describe()}")
 
     rebuilt_zone, info = splice_zone(zone, replacements, ptr_table=ptr_table, log=_log)
 

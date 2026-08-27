@@ -142,7 +142,7 @@ class ZoneMap:
         raise ValueError("stream offset 0x%X is not inside any captured read" % stream_off)
 
 
-def relocate_multi(zone: bytes, zmap: ZoneMap, insertions, log=None):
+def relocate_multi(zone: bytes, zmap: ZoneMap, insertions, log=None, align=None):
     """Open one or more aligned gaps in `zone`, relocating every affected pointer.
 
     `insertions` is an iterable against the *pristine* zone, each either
@@ -159,20 +159,27 @@ def relocate_multi(zone: bytes, zmap: ZoneMap, insertions, log=None):
     ``block, off = zmap.locate(buffer_offset)`` then ``threshold = off + old_span``.
 
     Each delta must already be a multiple of :data:`ALIGN` (see :func:`align_growth`).
+    Callers with a measured asset-specific alignment may override that check with
+    ``align``; localization asset arrays, for example, are contiguous 8-byte records and
+    must not receive the general 4 KiB allocation padding.
     Returns ``(new_zone_bytes, report_dict)``; the caller fills the gaps.
     """
     def say(msg):
         if log:
             log(msg)
 
+    required_align = ALIGN if align is None else align
+    if required_align <= 0:
+        raise ValueError("alignment must be positive")
+
     plan = []
     for item in sorted(insertions, key=lambda x: x[0]):
         stream_off, delta = item[0], item[1]
         if delta <= 0:
             continue
-        if delta % ALIGN:
-            raise ValueError("growth %d at 0x%X is not a multiple of %d; use align_growth()"
-                             % (delta, stream_off, ALIGN))
+        if delta % required_align:
+            raise ValueError("growth %d at 0x%X is not a multiple of %d"
+                             % (delta, stream_off, required_align))
         if len(item) >= 4:
             block, block_off = item[2], item[3]
         else:

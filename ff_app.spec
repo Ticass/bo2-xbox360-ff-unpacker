@@ -12,6 +12,8 @@ a = Analysis(
     pathex=[str(root)],
     binaries=[],
     datas=[
+        (str(root / "captures" / "manifest.json"), "captures"),
+        *[(str(p), "captures") for p in (root / "captures").glob("*.bin")],
         (str(root / "_tools" / "xmem_lzx_decompress.exe"), "_tools"),
         (str(root / "_tools" / "xmem_compress.exe"), "_tools"),
         # gsc-tool (GSC/CSC decompiler+compiler). Fetch with fetch_gsc_tool.py
@@ -20,7 +22,7 @@ a = Analysis(
     ],
     # gsc_link is imported lazily inside zone_rebuild._link_check; name it here so a
     # refactor cannot silently drop the link checker out of the frozen build.
-    hiddenimports=["gsc_tool", "zone_rebuild", "gsc_link"],
+    hiddenimports=["gsc_tool", "zone_rebuild", "gsc_link", "captures", "reloc"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,0 +1,32 @@
+[
+  {
+    "file": "patch_zm.rfazio.zone_ptrs.bin",
+    "title": "rfazio retail patch_zm.ff (stock)",
+    "note": "The 2013 retail Zombies patch zone, as shipped.",
+    "zone_size": 7295715,
+    "zone_md5": "0749c9f35f386ab85236b248510b3872",
+    "capture_md5": "add811ad6f54d7cfe9e2d9d3befbee9e",
+    "pointer_fields": 11731,
+    "stream_bytes_mapped": 7295715
+  },
+  {
+    "file": "patch_zm.tu18-stock.zone_ptrs.bin",
+    "title": "TU18 patch_zm.ff (stock)",
+    "note": "The TU18 Zombies patch zone, as shipped.",
+    "zone_size": 9280490,
+    "zone_md5": "85ee4cb24061cef33601649541b91c67",
+    "capture_md5": "b0448c8874e5793f1196dc060214a5bf",
+    "pointer_fields": 17084,
+    "stream_bytes_mapped": 9280490
+  },
+  {
+    "file": "patch_zm.tu18-classicmaps.zone_ptrs.bin",
+    "title": "TU18 patch_zm.ff with the classic-map table port applied",
+    "note": "Use this one if your patch_zm already has the ported map/gametype StringTables.",
+    "zone_size": 9288463,
+    "zone_md5": "4ea66b057ed62b7eccc6a425ccb21997",
+    "capture_md5": "870c666e99f971b292a1d9329a4b603e",
+    "pointer_fields": 16480,
+    "stream_bytes_mapped": 9288463
+  }
+]
