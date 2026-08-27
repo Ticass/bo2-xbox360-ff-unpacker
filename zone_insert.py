@@ -49,14 +49,40 @@ class InsertError(RuntimeError):
     pass
 
 
+def _asset_array_offset(zone: bytes, string_count: int, strings_ptr: int,
+                        depend_count: int, depends_ptr: int) -> int:
+    """Where the asset array actually starts.
+
+    NOT simply ``HDR + ASSET_LIST_SIZE``. The XAssetList's own inline arrays come first,
+    and for the script strings that means the pointer array *and every string body*, which
+    is only discoverable by walking them. A zone with no script strings does start at 64,
+    which is why localization zones worked with the naive constant and hid this: patch_zm
+    has 224 script strings and its array is at 4039, zm_transit has 1071 and its array is
+    at 22216 -- both confirmed against allocation records in a capture.
+    """
+    off = HDR + ASSET_LIST_SIZE
+    if string_count and strings_ptr == FOLLOWING:
+        ptrs = off
+        off += string_count * 4
+        for i in range(string_count):
+            if struct.unpack_from(">I", zone, ptrs + i * 4)[0] == FOLLOWING:
+                end = zone.find(b"\x00", off)
+                if end < 0:
+                    raise InsertError("unterminated script string while locating the asset array")
+                off = end + 1
+    if depend_count and depends_ptr == FOLLOWING:
+        off += depend_count * 4
+    return off
+
+
 def parse(zone: bytes) -> dict:
     """Header and asset-array geometry of a decompressed zone."""
     if len(zone) < HDR + ASSET_LIST_SIZE:
         raise InsertError("too short to be a zone")
     stream_size = struct.unpack_from(">I", zone, HDR_STREAM_SIZE)[0]
     blocks = list(struct.unpack_from(">8I", zone, HDR_BLOCKS))
-    asset_count = struct.unpack_from(">I", zone, HDR + 16)[0]
-    array_off = HDR + ASSET_LIST_SIZE
+    string_count, strings_ptr, depend_count, depends_ptr, asset_count, _assets_ptr =         struct.unpack_from(">6I", zone, HDR)
+    array_off = _asset_array_offset(zone, string_count, strings_ptr, depend_count, depends_ptr)
     array_size = asset_count * 8
     if array_off + array_size > len(zone):
         raise InsertError(f"asset array ({asset_count} entries) runs past the end of the zone")
