@@ -26,6 +26,16 @@ Four steps, in this order, because each depends on the last:
 4. **Bump assetCount, the stream size and the owning XBlock size.** Step 1 already
    accounted for the array growth; only the appended bodies are still unrecorded.
 
+**KNOWN LIMITATION -- this does not yet produce a loadable patch_zm.** Measured by bisect
+against the ReXGlue capture harness: the unmodified zone loads (full 318408-byte capture),
+while the same zone plus ONE 39-byte LocalizeEntry crashes during chunk decompression, as
+does the same zone plus a 294 KB XModel. The body is irrelevant; any insertion breaks it.
+The localization zone this module was validated against loads fine, so the difference is
+structural -- patch_zm has 224 script strings (the loc zone has none), its asset array is
+mid-stream at 4039 rather than at 64, and it populates three XBlocks rather than two.
+Reproducing a known-good output byte-for-byte was necessary but not sufficient. Treat
+insertion as proven only for localization-shaped zones until this is understood.
+
 What this does NOT do is resolve dependencies. A body containing an encoded pointer is
 only valid if whatever it points at is really in the zone at that block and offset. For a
 self-contained asset (a LocalizeEntry is two inline strings) there is nothing to resolve;
@@ -101,8 +111,21 @@ def asset_types(zone: bytes) -> list[int]:
     return [struct.unpack_from(">I", zone, off + i * 8)[0] for i in range(info["asset_count"])]
 
 
-def insert(zone: bytes, zmap: reloc.ZoneMap, assets, log=None) -> tuple[bytes, dict]:
-    """Append `assets` -- an iterable of ``(asset_type, body_bytes)`` -- to the zone."""
+def insert(zone: bytes, zmap: reloc.ZoneMap, assets, log=None,
+           block_deltas: dict[int, int] | None = None) -> tuple[bytes, dict]:
+    """Append `assets` -- an iterable of ``(asset_type, body_bytes)`` -- to the zone.
+
+    ``block_deltas`` maps XBlock index -> bytes to add to that block's size, and must sum to
+    the total body length. It is REQUIRED for any asset whose reads land in more than one
+    block, which is most of them: an XModel's struct and its data go to different blocks.
+    Measured for the TranZit turbine: 293222 bytes into XBlock 5 and 984 into XBlock 0.
+
+    Omitting it charges the whole body to the block owning the stream tail. That is right
+    only for a single-block asset -- a LocalizeEntry, say -- and silently wrong otherwise:
+    the under-sized block overflows during load and the zone dies partway through, which is
+    exactly what an XModel inserted without it does. Get the split from the SOURCE zone's
+    capture by tallying `block_of(seg.dest)` over the body's reads.
+    """
     def say(msg):
         if log:
             log(msg)
@@ -149,12 +172,26 @@ def insert(zone: bytes, zmap: reloc.ZoneMap, assets, log=None) -> tuple[bytes, d
     struct.pack_into(">I", out, HDR + 16, count + n)
     new_stream = struct.unpack_from(">I", out, HDR_STREAM_SIZE)[0] + len(bodies)
     struct.pack_into(">I", out, HDR_STREAM_SIZE, new_stream)
-    block_field = HDR_BLOCKS + 4 * tail_block
-    new_block = struct.unpack_from(">I", out, block_field)[0] + len(bodies)
-    struct.pack_into(">I", out, block_field, new_block)
+
+    if block_deltas is None:
+        block_deltas = {tail_block: len(bodies)}
+        say(f"no block split given; charging all {len(bodies)} bytes to XBlock {tail_block} "
+            "-- only correct for an asset whose reads all land in one block")
+    if sum(block_deltas.values()) != len(bodies):
+        raise InsertError(f"block_deltas sum to {sum(block_deltas.values())} but the bodies are "
+                          f"{len(bodies)} bytes; every appended byte must be charged to a block")
+
+    grown_blocks = {}
+    for blk, delta in sorted(block_deltas.items()):
+        if not 0 <= blk < 8:
+            raise InsertError(f"XBlock index {blk} out of range")
+        field = HDR_BLOCKS + 4 * blk
+        value = struct.unpack_from(">I", out, field)[0] + delta
+        struct.pack_into(">I", out, field, value)
+        grown_blocks[blk] = value
 
     say(f"assetCount {count} -> {count + n}, stream {info['stream_size']} -> {new_stream}, "
-        f"XBlock[{tail_block}] -> {new_block}")
+        + ", ".join(f"XBlock[{b}] +{block_deltas[b]} -> {v}" for b, v in grown_blocks.items()))
 
     result = {
         "added": n,
@@ -163,6 +200,7 @@ def insert(zone: bytes, zmap: reloc.ZoneMap, assets, log=None) -> tuple[bytes, d
         "relocated": report["relocated"],
         "asset_count": count + n,
         "tail_block": tail_block,
+        "block_deltas": dict(block_deltas),
         "new_zone_size": len(out),
     }
     return bytes(out), result
